@@ -47,7 +47,8 @@ filterwarnings = [
 ]
 
 [tool.ruff]
-line-length = 180
+line-length = 80
+indent-width = 2
 
 [tool.ruff.lint.extend-per-file-ignores]
 # Also ignore `E402` in all `__init__.py` files.
@@ -56,3 +57,7 @@ line-length = 180
 [tool.ruff.lint]
 extend-select = ["UP"]
 ignore = ["F722"]
+
+[tool.ruff.format]
+# Force the formatter to use spaces instead of tabs
+indent-style = "space"
