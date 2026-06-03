@@ -4,76 +4,105 @@
 # uv run cs336_systems/section_2_profiling.py
 #
 # Detailed profiling (using Nvidia Nsight Systems):
-# uv run nsys profile --trace=cuda,cudnn,cublas,osrt,nvtx --pytorch=functions-trace,autogradshapes-nvtx --cudabacktrace=all --python-backtrace=cuda --gpu-metrics-devices=0 -- python benchmark.py
+# uv run nsys profile --trace=cuda,cudnn,cublas,osrt,nvtx --pytorch=functions-trace,autograd-shapes-nvtx --cudabacktrace=all --python-backtrace=cuda --gpu-metrics-devices=0 -- python cs336_systems/benchmark.py
 #
 # Less-detailed profiling:
 # uv run nsys profile -- python benchmark.py
 
-import timeit
+from contextlib import nullcontext
 import torch
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics import model, nn_utils, optimizer
 
 BATCH_SIZE = 4
-CONTEXT_LENGTH = 512
+# CONTEXT_LENGTH = 512
+# CONTEXT_LENGTH = 512 * 1
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 WARMUP_ITERS = 5
 PROFILE_ITERS = 20
 
+MODEL_CONFIG_S = {
+  "vocab_size": 10_000,
+  "context_length": 512,
+  "d_model": 768,
+  "num_layers": 12,
+  "num_heads": 12,
+  "d_ff": 3072,
+}
 
+MODEL_CONFIG_S_SC = {
+  "vocab_size": 10_000,
+  "context_length": 128,
+  "d_model": 768,
+  "num_layers": 12,
+  "num_heads": 12,
+  "d_ff": 3072,
+}
+
+MODEL_CONFIG_M = {
+  "vocab_size": 10_000,
+  "context_length": 512,
+  "d_model": 1024,
+  "num_layers": 24,
+  "num_heads": 16,
+  "d_ff": 4096,
+}
+
+MODEL_CONFIG_M_SC = {
+  "vocab_size": 10_000,
+  "context_length": 128,
+  "d_model": 1024,
+  "num_layers": 24,
+  "num_heads": 16,
+  "d_ff": 4096,
+}
+
+model_config = MODEL_CONFIG_M
+
+
+@nvtx.range("training loop")
 def main():
   print(f"Using device: {DEVICE}")
   lm = model.BasicsTransformerLM(
-    vocab_size=10_000,
-    context_length=CONTEXT_LENGTH,
-    d_model=1024,
-    num_layers=24,
-    num_heads=16,
-    d_ff=4096,
+    vocab_size=model_config["vocab_size"],
+    context_length=model_config["context_length"],
+    d_model=model_config["d_model"],
+    num_layers=model_config["num_layers"],
+    num_heads=model_config["num_heads"],
+    d_ff=model_config["d_ff"],
   ).to(DEVICE)
 
   optim = optimizer.AdamW(lm.parameters(), lr=1e-3)
 
-  profile_forward = []
-  profile_forward_and_backward = []
-  profile_forward_and_backward_and_optimizer = []
-
   for it in range(WARMUP_ITERS + PROFILE_ITERS):
     optim.zero_grad()
 
-    inp = torch.randint(0, 10_000, (BATCH_SIZE, CONTEXT_LENGTH)).to(DEVICE)
+    inp = torch.randint(
+      0, 10_000, (BATCH_SIZE, model_config["context_length"])
+    ).to(DEVICE)
 
-    start = timeit.default_timer()
-    logits = lm(inp)
-    torch.cuda.synchronize()  # Ensure all CUDA operations are finished before stopping the timer.
-    if it >= WARMUP_ITERS:
-      profile_forward.append(timeit.default_timer() - start)
+    forward_context = (
+      nullcontext() if it < WARMUP_ITERS else nvtx.range("forward pass")
+    )
+    with forward_context:
+      logits = lm(inp)
 
-    # Use inp as target for simplicity, since the model is untrained and we just want to profile the forward and backward pass.
-    loss = nn_utils.cross_entropy(inputs=logits, targets=inp)
-    loss.backward()
-    torch.cuda.synchronize()  # Ensure all CUDA operations are finished before stopping the timer.
-    if it >= WARMUP_ITERS:
-      profile_forward_and_backward.append(timeit.default_timer() - start)
+    backward_context = (
+      nullcontext() if it < WARMUP_ITERS else nvtx.range("backward pass")
+    )
+    with backward_context:
+      # Use inp as target for simplicity, since the model is untrained and we just want to profile the forward and backward pass.
+      loss = nn_utils.cross_entropy(inputs=logits, targets=inp)
+      loss.backward()
 
-    optim.step()
-    torch.cuda.synchronize()  # Ensure all CUDA operations are finished before stopping the timer.
-    if it >= WARMUP_ITERS:
-      profile_forward_and_backward_and_optimizer.append(
-        timeit.default_timer() - start
-      )
-
-  print(
-    f"Average forward pass time: {sum(profile_forward) / len(profile_forward):.4f} seconds"
-  )
-  print(
-    f"Average forward and backward pass time: {sum(profile_forward_and_backward) / len(profile_forward_and_backward):.4f} seconds"
-  )
-  print(
-    f"Average forward, backward, and optimizer time: {sum(profile_forward_and_backward_and_optimizer) / len(profile_forward_and_backward_and_optimizer):.4f} seconds"
-  )
+    optimizer_context = (
+      nullcontext() if it < WARMUP_ITERS else nvtx.range("optimizer step")
+    )
+    with optimizer_context:
+      optim.step()
 
 
 if __name__ == "__main__":
