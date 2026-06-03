@@ -293,3 +293,57 @@ Matmul has **255× more FLOPs** than softmax but takes only **1.13× more time**
 - Softmax is **memory-bandwidth-bound**: each step (max, exp, sum, div) reads and writes the full attention matrix (B·H·T·T ≈ 67 MB at fp32); with ~900 GB/s bandwidth, 5 passes ≈ 370 μs — matching observations
 
 This is the core motivation for **FlashAttention**: by fusing the softmax steps and tiling over the T×T matrix, it avoids multiple full reads/writes of the attention matrix, making softmax effectively bandwidth-free relative to the surrounding matmuls.
+
+---
+
+## Mixed Precision Observations
+
+**Verified with `benchmark_with_precision.py`:**
+
+```
+param fc1.weight:  torch.float32
+param ln.weight:   torch.float32
+param ln.bias:     torch.float32
+param fc2.weight:  torch.float32
+
+Forward after fc1:  x.dtype = torch.float16
+Forward after ln:   x.dtype = torch.float32
+Forward after fc2:  x.dtype = torch.float16
+
+logits dtype:  torch.float16
+loss dtype:    torch.float32
+
+grad for fc1.weight:  torch.float32
+grad for ln.weight:   torch.float32
+grad for ln.bias:     torch.float32
+grad for fc2.weight:  torch.float32
+```
+
+**Key findings:**
+
+1. **Model parameters are always stored as FP32.** `torch.autocast` does not modify the stored weights. At the point of a matmul, weights are downcast to FP16 on-the-fly (a temporary cast, not written back). The FP32 master copy is the source of truth for the optimizer.
+
+2. **Matmul: FP16 input → FP16 output.** Both the (transiently-cast) weight and the activation are FP16 entering the linear layer; the output activation is FP16. Tensor cores accumulate in FP32 internally but deliver FP16 output by default under autocast.
+
+3. **Reductions and accumulations output FP32.** LayerNorm (mean/variance reduction) and the loss computation both output FP32 — autocast keeps these in FP32 to avoid the accumulation precision failure. The FP32 activation is then downcast to FP16 on entry to the next matmul.
+
+4. **Gradients are FP32.** Even though activations flow as FP16 during the forward pass, all `.grad` tensors are FP32. Autograd upcasts during the backward pass so that gradient accumulation is numerically stable — same reason as the optimizer: gradients are summed across many terms and must not stall.
+
+**Data flow (forward + backward):**
+```
+FP32 weights ──(on-the-fly cast)──► FP16
+                                      │
+                                   matmul ──► FP16 activations
+                                                   │
+                                              LayerNorm (FP32) ──► FP32
+                                                                     │
+                                                             (on-the-fly cast)
+                                                                     │
+                                                                  matmul ──► FP16 logits
+                                                                                  │
+                                                                             loss (FP32)
+                                                                                  │
+                                                                    backward ──► FP32 gradients
+                                                                                  │
+                                                                    optimizer updates FP32 weights
+```
