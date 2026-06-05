@@ -166,3 +166,6 @@ cython_debug/
 # NVIDIA Nsight Systems
 *.nsys-rep
 report*.sqlite
+
+# Memory profiles
+memory_profile_*.pickle

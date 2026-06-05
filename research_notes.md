@@ -347,3 +347,96 @@ FP32 weights ──(on-the-fly cast)──► FP16
                                                                                   │
                                                                     optimizer updates FP32 weights
 ```
+
+---
+
+## Memory Profiling (PyTorch Memory Visualizer)
+
+### Memory breakdown by phase (Adam optimizer, fp32)
+
+Let P = parameter memory. Adam stores two moment buffers (m, v), each the same size as parameters.
+
+| Phase | Contents | Formula |
+|---|---|---|
+| Forward pass peak (end of fwd) | params + optimizer states + all saved activations | P + 2P + A |
+| End of backward | params + optimizer states + gradients (activations freed) | P + 2P + P = 4P |
+| Optimizer step | same as end of backward | 4P |
+| Inference (`torch.no_grad()`) | params only | P |
+
+### Memory over a training iteration
+
+- **Peak occurs at the forward/backward boundary** — not strictly "during forward." Autograd saves intermediate activations layer by layer as the forward pass runs, accumulating them all simultaneously so backward can use them. The very first step of backward sees the same memory as the last step of forward. This is the highest-memory point of the iteration.
+- **Backward decreases memory monotonically.** Backward runs in reverse layer order; each layer consumes its saved activations to compute gradients then frees them. By the time the optimizer step runs, only params + gradients + optimizer states remain (~4P).
+- **Whether optimizer phase is ~50% of peak depends on activation size.** If A ≈ P, optimizer/peak = 4/6 ≈ 67%. If A ≈ 5P, it's 4/10 = 40%. The observed ~50% puts activations at roughly the same magnitude as all non-activation memory combined.
+
+Memory timeline within one training iteration:
+```
+forward (growing) ──► fwd/bwd boundary (peak: 3P+A) ──► backward (shrinking) ──► optimizer (4P, ~50% of peak)
+```
+
+### Inference vs. training memory
+
+- **Inference only (`torch.no_grad()`) uses ~10% of the training peak** and is flat/stable throughout.
+- The entire activation memory is absent — PyTorch skips saving intermediate tensors when gradient tracking is disabled. No gradients or optimizer states exist either.
+- Remaining memory is parameters only (~P). If training peak is ~10P (e.g., A = 7P, non-activation = 3P), inference at P is exactly 10%.
+
+| Mode | Relative Memory | Stable? |
+|---|---|---|
+| Training (fwd/bwd boundary peak) | 100% | No — grows through fwd, drops through bwd |
+| Training (optimizer phase) | ~50% | Briefly stable |
+| Inference (`torch.no_grad()`) | ~10% | Yes — flat throughout |
+
+### Measured: MODEL_CONFIG_M
+
+**Model:** vocab_size=10,000 · d_model=1024 · num_layers=24 · num_heads=16 · d_ff=4096
+
+| Config | context_length | Training peak | Activation % of peak | Activation (abs) | Non-activation (abs) | Inference peak | Inference / Training |
+|---|---|---|---|---|---|---|---|
+| MODEL_CONFIG_M     | 512 | 13.5 GB | ~50% | ~6.75 GB | ~6.75 GB | 2.0 GB | ~15% |
+| MODEL_CONFIG_M_SC  | 128 |  6.5 GB | ~70% | ~4.55 GB | ~1.95 GB | 1.7 GB | ~26% |
+
+**Derived observations:**
+
+- **Inference ≈ params only (~2 GB).** Both configs show inference at ~1.7–2.0 GB regardless of context length, consistent with parameters alone (P ≈ 2 GB; no gradients, optimizer states, or saved activations).
+- **Shortening context 4× (512→128) cuts training peak by ~52%** (13.5→6.5 GB), driven almost entirely by fewer saved activations (6.75→4.55 GB, −33%). Non-activation memory should be fixed at ~4P ≈ 8 GB after backward, but the measured ~6.75 GB vs ~1.95 GB non-activation split suggests the visualizer is measuring the fwd/bwd peak where optimizer states may not yet be fully allocated, or some temporary buffers scale with context.
+- **Activation fraction rises from 50% → 70% with shorter context** — the absolute activation shrinks, but the non-activation floor (params + optimizer states) stays fixed, so activations become proportionally smaller relative to total peak.
+- **Activation scales sub-linearly with context** (−33% for 4× context reduction). If activations were purely linear in T (MLP-dominated), we'd expect −75%; the shallower drop suggests either attention's T²-scaled buffers still contribute at 512, or residual/embedding activations add a context-independent baseline.
+
+### Effect of Mixed Precision (`torch.autocast`)
+
+**Inference:** memory *increased* by ~0.3 GB.
+- Counterintuitive because FP16 activations are smaller, but parameters are still stored as FP32 master copies. PyTorch caches FP16 casts of the weights within the autocast context to avoid redundant recasting — that cache adds memory. Meanwhile, activation savings during inference are near zero: with `torch.no_grad()` activations are consumed and freed layer by layer, so there is almost nothing to halve.
+- Net result: FP16 weight cache overhead > activation savings → memory increases slightly.
+- **Mixed precision is a training optimization, not an inference one.** To actually reduce inference memory, store the model directly in FP16 (`model.half()`), which cuts parameter memory 2× with no cache overhead. `torch.autocast` is designed for the training case where the FP32 master weights must be preserved for the optimizer.
+
+**Training — gradients: unchanged.**
+- Gradients are always FP32 regardless of autocast, so gradient memory is identical to full-precision training. The GradScaler scales the loss value but does not change gradient dtype.
+
+**Training — activations: reduced by ~50%.**
+- Saved activations (stored at the fwd/bwd boundary for use during backprop) are now FP16 instead of FP32 — half the size. This is the main memory benefit of mixed precision training.
+- Updated formula for training peak: P + 2P + A/2 = 3P + A/2 (vs. 3P + A full-precision).
+
+| Component | Full Precision | Mixed Precision | Change |
+|---|---|---|---|
+| Parameters | FP32 (P) | FP32 (P) | none |
+| Optimizer states | FP32 (2P) | FP32 (2P) | none |
+| Gradients | FP32 (P) | FP32 (P) | none |
+| Saved activations | FP32 (A) | FP16 (A/2) | **−50%** |
+| Inference overhead | P | P + ~0.3 GB | **+0.3 GB** |
+
+### Largest single allocations: `scaled_dot_product_attention`
+
+**Observation:** The PyTorch memory visualizer shows the largest individual allocations during the forward pass come from `scaled_dot_product_attention`. FlashAttention is NOT being used — the naive math backend is active, which fully materializes the attention score matrix in HBM.
+
+**This is expected.** Every other tensor in the transformer scales as O(B·T·d_model) — linear in sequence length. The attention score matrix is the only O(B·H·T²) tensor in the model:
+
+| Tensor | Shape | Size per layer (B=4, T=512) |
+|---|---|---|
+| MLP activation | `[B, T, d_ff]` = `[4, 512, 4096]` | ~32 MB |
+| Attention score matrix | `[B, H, T, T]` = `[4, 16, 512, 512]` | ~67 MB |
+
+At T=512, the attention matrix is **2× larger than the MLP activation per layer** — purely from the T² factor, despite d_ff=4096 >> d_head=64. Across 24 layers: ~67 MB × 24 ≈ **1.6 GB** just for attention score matrices.
+
+With the naive backend, `scaled_dot_product_attention` materializes the full `[B, H, T, T]` softmax output and saves it for the backward pass (needed to compute the gradient through softmax). That saved tensor is the largest per-layer allocation visible in the profiler — it is the direct cost of not using FlashAttention.
+
+**This is precisely why FlashAttention exists.** It fuses the attention computation into tiles and never materializes the full T×T matrix in HBM. The backward pass recomputes attention scores on-the-fly from saved per-row log-sum-exp statistics (O(B·H·T)), bringing attention memory from O(T²) back to O(T). The compute cost increases slightly (recomputation), but the memory savings are the entire T×T matrix per layer.
