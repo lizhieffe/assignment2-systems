@@ -16,6 +16,16 @@ import torch
 import torch.cuda.nvtx as nvtx
 
 from cs336_basics import model, nn_utils, optimizer
+from cs336_systems.model_configs import (  # noqa: F401
+  MODEL_CONFIG_S,
+  MODEL_CONFIG_S_LC,
+  MODEL_CONFIG_S_SC,
+  MODEL_CONFIG_M,
+  MODEL_CONFIG_M_LC,
+  MODEL_CONFIG_M_SC,
+  MODEL_CONFIG_XL_LC,
+  MODEL_CONFIG_XL_SC,
+)
 
 BATCH_SIZE = 4
 # CONTEXT_LENGTH = 512
@@ -25,78 +35,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 WARMUP_ITERS = 5
 PROFILE_ITERS = 20
-
-MODEL_CONFIG_S = {
-  "vocab_size": 10_000,
-  "context_length": 512,
-  "d_model": 768,
-  "num_layers": 12,
-  "num_heads": 12,
-  "d_ff": 3072,
-}
-
-MODEL_CONFIG_S_LC = {
-  "vocab_size": 10_000,
-  "context_length": 2048,
-  "d_model": 768,
-  "num_layers": 12,
-  "num_heads": 12,
-  "d_ff": 3072,
-}
-
-MODEL_CONFIG_S_SC = {
-  "vocab_size": 10_000,
-  "context_length": 128,
-  "d_model": 768,
-  "num_layers": 12,
-  "num_heads": 12,
-  "d_ff": 3072,
-}
-
-MODEL_CONFIG_M = {
-  "vocab_size": 10_000,
-  "context_length": 512,
-  "d_model": 1024,
-  "num_layers": 24,
-  "num_heads": 16,
-  "d_ff": 4096,
-}
-
-MODEL_CONFIG_M_LC = {
-  "vocab_size": 10_000,
-  "context_length": 2048,
-  "d_model": 1024,
-  "num_layers": 24,
-  "num_heads": 16,
-  "d_ff": 4096,
-}
-
-MODEL_CONFIG_M_SC = {
-  "vocab_size": 10_000,
-  "context_length": 128,
-  "d_model": 1024,
-  "num_layers": 24,
-  "num_heads": 16,
-  "d_ff": 4096,
-}
-
-MODEL_CONFIG_XL_LC = {
-  "vocab_size": 10_000,
-  "context_length": 2048,
-  "d_model": 2560,
-  "num_layers": 32,
-  "num_heads": 32,
-  "d_ff": 10240,
-}
-
-MODEL_CONFIG_XL_SC = {
-  "vocab_size": 10_000,
-  "context_length": 128,
-  "d_model": 2560,
-  "num_layers": 32,
-  "num_heads": 32,
-  "d_ff": 10240,
-}
 
 model_config = MODEL_CONFIG_M
 enable_mixed_precision = False

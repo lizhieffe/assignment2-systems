@@ -1,4 +1,4 @@
-# Section 2: autograd residules
+# Section 3: autograd residules
 #
 # Run the code:
 # uv run cs336_systems/autograd_residule.py

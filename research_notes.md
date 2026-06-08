@@ -508,3 +508,73 @@ In eager mode the autograd graph is a DAG of individual ops. Backward traverses 
 
 **All saved tensors have `grad_fn=None`.**
 In eager mode, saved intermediates like `rsqrt(mean(x²)+ε)` carry a `grad_fn` because autograd may need to differentiate *through* them — they are live nodes in the computation graph, and their gradient history must be preserved. With `torch.compile`, the backward is a pre-derived fused kernel that directly implements the analytic gradient formula for the whole RMSNorm operation. The saved tensors are just raw numerical inputs to that formula; the kernel does not backprop through them. They are therefore stored as detached values (`grad_fn=None`), replacing graph structure with compiled code.
+
+---
+
+## Gradient Checkpointing
+
+**Setup:** 4× TransformerBlock (d_model=2560, d_ff=10240, num_heads=32, context_length=2048) with `torch.compile`. Activation memory measured via `saved_tensors_hooks` over the forward pass. Checkpointing applied to 2-block segments: `checkpoint(two_blocks, x)` × 2.
+
+| Config | Saved activation memory |
+|---|---|
+| No checkpointing | 14 GB |
+| Checkpointing (`use_reentrant=False`) | 0.16 GB |
+| Checkpointing (`use_reentrant=True`) | ~14 GB (same as no checkpointing) |
+
+**~87× reduction** from no-checkpointing to `use_reentrant=False`.
+
+### Why `use_reentrant=True` fails with `torch.compile`
+
+`use_reentrant=True` suppresses intermediate saves by running the checkpointed forward under `torch.no_grad()`. With `torch.compile`, the function is compiled into a fused kernel that bypasses the standard autograd save mechanism — the compiled graph does not properly respond to the `no_grad` suppression, so intermediates are still recorded. Result: no memory savings.
+
+`use_reentrant=False` uses `torch.autograd.graph.saved_tensors_hooks` internally to intercept and discard saved tensors during the checkpointed forward. This operates at a lower level that `torch.compile` respects, so discarding actually takes effect.
+
+**Practical rule: always use `use_reentrant=False`, especially with `torch.compile`.**
+
+### Why the reduction is so large (~87×)
+
+Without checkpointing, all intermediate activations from 4 blocks are saved: attention score matrices `[B, H, T, T]` = `[4, 32, 2048, 2048]` (~2 GB each at fp32) plus MLP and residual activations across all 4 blocks account for the 14 GB total.
+
+With `use_reentrant=False`, each `checkpoint(two_blocks, x)` call saves only the input `x` to that 2-block segment (`[4, 2048, 2560]` ≈ 0.08 GB) and discards all intermediates inside. Two checkpoints = ~0.16 GB total. During backward, the 2-block forward is recomputed on-the-fly to recover the needed intermediates — trading compute for memory.
+
+---
+
+### Experiment: Varying Checkpoint Granularity — MODEL_CONFIG_L
+
+**Model:** d_model=1280 · d_ff=5120 · num_layers=36 · num_heads=20 · context_length=512 · batch_size=4 · `torch.compile` enabled.
+
+Granularity = number of blocks per checkpoint segment. More blocks per segment → fewer segments → less saved activation memory → more recomputation during backward.
+
+#### Saved activation memory (forward pass)
+
+| Granularity | Segments | Saved activations | Expected (inputs only) |
+|---|---|---|---|
+| BLOCKS_1  | 36 | 0.35 GB | 0.35 GB |
+| BLOCKS_2  | 18 | 0.18 GB | 0.18 GB |
+| BLOCKS_4  |  9 | 0.09 GB | 0.09 GB |
+| BLOCKS_6  |  6 | 0.06 GB | 0.06 GB |
+| BLOCKS_9  |  4 | 0.04 GB | 0.04 GB |
+| BLOCKS_12 |  3 | 0.03 GB | 0.03 GB |
+| BLOCKS_18 |  2 | 0.02 GB | 0.02 GB |
+| BLOCKS_36 |  1 | 0.01 GB | 0.01 GB |
+
+Saved activations = segment inputs only. Measured == Expected in every case, confirming that `torch.compile` + `use_reentrant=False` discards all intermediates inside each segment and retains only the segment boundary tensor.
+
+Input tensor size: `[4, 512, 1280]` × 4 bytes = 10,485,760 bytes ≈ 0.01 GB per segment. Total = 0.01 GB × num_segments, so saved memory scales exactly linearly with the number of segments (inversely with segment size).
+
+#### Peak memory during backward pass
+
+| Granularity | Segments | Peak memory |
+|---|---|---|
+| BLOCKS_1  | 36 |  1.0 GB |
+| BLOCKS_2  | 18 |  1.1 GB |
+| BLOCKS_4  |  9 |  1.8 GB |
+| BLOCKS_6  |  6 |  2.4 GB |
+| BLOCKS_9  |  4 |  3.4 GB |
+| BLOCKS_12 |  3 |  4.5 GB |
+| BLOCKS_18 |  2 |  6.5 GB |
+| BLOCKS_36 |  1 | 13.0 GB |
+
+**Key takeaway:** BLOCKS_36 (one big checkpoint) peaks at 13 GB — the entire forward is recomputed inside backward, materializing all 36 blocks' activations simultaneously. BLOCKS_1 (one block per segment) peaks at only 1 GB — during backward, only one block's activations are live at a time (recomputed, used for grad, freed). The peak is dominated by that one recomputed block, not the full model.
+
+This is the fundamental memory–compute tradeoff of gradient checkpointing: finer granularity (smaller segments) reduces peak memory but multiplies recompute work, since each segment is recomputed once during backward.
