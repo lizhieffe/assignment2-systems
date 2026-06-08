@@ -402,6 +402,33 @@ forward (growing) ──► fwd/bwd boundary (peak: 3P+A) ──► backward (sh
 - **Activation fraction rises from 50% → 70% with shorter context** — the absolute activation shrinks, but the non-activation floor (params + optimizer states) stays fixed, so activations become proportionally smaller relative to total peak.
 - **Activation scales sub-linearly with context** (−33% for 4× context reduction). If activations were purely linear in T (MLP-dominated), we'd expect −75%; the shallower drop suggests either attention's T²-scaled buffers still contribute at 512, or residual/embedding activations add a context-independent baseline.
 
+### Effect of `torch.compile` on Memory (MODEL_CONFIG_M, context_length=512)
+
+| Phase | Memory |
+|---|---|
+| Forward peak (fwd/bwd boundary) | 12 GB |
+| Backward peak (end of backward) | 6.5 GB |
+
+**Comparison to no-compile baseline (13.5 GB forward peak):**
+- Forward peak drops from 13.5 GB → 12 GB (−1.5 GB, −11%). This matches the reduction in saved activations: kernel fusion eliminates duplicate intermediate saves (e.g., rsqrt and x saved once instead of twice in RMSNorm), cutting activation memory across all 24 layers.
+- Backward "peak" of 6.5 GB is the floor after all activations have been freed, leaving params + gradients + optimizer states ≈ 4P. This is consistent with P ≈ 1.5–2 GB for this model size.
+- The two peaks are no longer equal: in eager mode the fwd/bwd boundary is both the end of forward and start of backward, so one number describes both. With `torch.compile` the fwd peak (12 GB, all activations resident) and the bwd floor (6.5 GB, activations freed) differ by the amount of activation memory saved by the fused kernels (~5.5 GB), demonstrating how much activation memory is consumed and released during the backward pass.
+
+**Why the 1.5 GB savings is modest (and expected):**
+
+`torch.compile` only helps ops that were previously split into multiple eager graph nodes. The dominant activation memory consumers are already single ops and are unaffected:
+
+- **Attention score matrix** `[B, H, T, T]` — already a single op (`scaled_dot_product_attention`). Compile cannot fuse further; the full ~1.6 GB across 24 layers is still saved for backward.
+- **MLP activations** `[B, T, d_ff]` — the large intermediate after the up-projection (~32 MB × 24 layers ≈ 768 MB) still must be saved for backward.
+
+What compile does help: RMSNorm and other pointwise chains. With ~48 RMSNorm layers (2 per block × 24 layers), each saving ~16 MB fewer tensors (eliminating the duplicate x and rsqrt saves at d_model=1024), that is ~750 MB — roughly half the observed 1.5 GB total savings, with the remainder from other fused elementwise ops.
+
+**To get larger activation savings, compile alone is insufficient.** The right tools are:
+- **Gradient checkpointing** — recompute activations during backward instead of saving them; trades compute for memory.
+- **FlashAttention** — eliminates the T×T attention matrix entirely via online softmax tiling, saving ~1.6 GB of the dominant per-layer allocation.
+
+---
+
 ### Effect of Mixed Precision (`torch.autocast`)
 
 **Inference:** memory *increased* by ~0.3 GB.
@@ -440,3 +467,44 @@ At T=512, the attention matrix is **2× larger than the MLP activation per layer
 With the naive backend, `scaled_dot_product_attention` materializes the full `[B, H, T, T]` softmax output and saves it for the backward pass (needed to compute the gradient through softmax). That saved tensor is the largest per-layer allocation visible in the profiler — it is the direct cost of not using FlashAttention.
 
 **This is precisely why FlashAttention exists.** It fuses the attention computation into tiles and never materializes the full T×T matrix in HBM. The backward pass recomputes attention scores on-the-fly from saved per-row log-sum-exp statistics (O(B·H·T)), bringing attention memory from O(T²) back to O(T). The compute cost increases slightly (recomputation), but the memory savings are the entire T×T matrix per layer.
+
+---
+
+## Autograd Saved Tensors — Effect of `torch.compile` on RMSNorm
+
+**Setup:** `RMSNorm(d_model=2560)` on input `x` of shape `[4, 512, 2560]` with `requires_grad=True`. Saved tensors observed via `torch.autograd.graph.saved_tensors_hooks`.
+
+### Without `torch.compile`
+
+```
+Saving activation: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None         # x
+Saving activation: shape=torch.Size([4, 512, 1]),    dtype=torch.float32, grad_fn=<RsqrtBackward0>  # rsqrt(mean(x²)+ε)
+Saving activation: shape=torch.Size([4, 512, 1]),    dtype=torch.float32, grad_fn=<RsqrtBackward0>  # same rsqrt, saved again for second backward node
+Saving activation: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None         # x (saved again)
+Saving activation: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=<MulBackward0>   # x_normalized = x * rsqrt
+Saving activation: shape=torch.Size([2560]),         dtype=torch.float32, grad_fn=None         # weight
+```
+
+6 tensors saved — one per autograd graph node that needs inputs for its backward function.
+
+### With `torch.compile`
+
+```
+Saving activation: shape=torch.Size([4, 512, 2560]), dtype=torch.float32, grad_fn=None   # x
+Saving activation: shape=torch.Size([2560]),         dtype=torch.float32, grad_fn=None   # weight
+Saving activation: shape=torch.Size([4, 512, 1]),    dtype=torch.float32, grad_fn=None   # rsqrt (no grad_fn — fused)
+```
+
+3 tensors saved — half the storage.
+
+### Key Takeaway
+
+`torch.compile` fuses the RMSNorm forward pass into a single kernel. In the eager (unfused) path, autograd inserts a separate graph node for each op (mul, rsqrt, mul again, etc.), and each node independently saves the tensors it needs for its own backward — resulting in duplicate saves (rsqrt saved twice, x saved twice). With compilation, the entire forward is one fused op with one combined backward, so autograd only saves what is strictly necessary once: x, weight, and rsqrt. Kernel fusion reduces saved activation count by ~50% for RMSNorm.
+
+### Additional Observations
+
+**Loading order no longer reverses saving order.**
+In eager mode the autograd graph is a DAG of individual ops. Backward traverses that DAG in reverse topological order, so the last forward op's backward node runs first and loads its saved tensors first — this is what produces the reversed loading pattern. With `torch.compile`, all ops are collapsed into a single fused kernel with a single custom backward. That backward loads its saved tensors in whatever order the compiled code accesses them; there is no sub-op DAG to impose a reverse-order constraint.
+
+**All saved tensors have `grad_fn=None`.**
+In eager mode, saved intermediates like `rsqrt(mean(x²)+ε)` carry a `grad_fn` because autograd may need to differentiate *through* them — they are live nodes in the computation graph, and their gradient history must be preserved. With `torch.compile`, the backward is a pre-derived fused kernel that directly implements the analytic gradient formula for the whole RMSNorm operation. The saved tensors are just raw numerical inputs to that formula; the kernel does not backprop through them. They are therefore stored as detached values (`grad_fn=None`), replacing graph structure with compiled code.

@@ -1,4 +1,6 @@
 # Section 2: Profiling
+# Include both 1) CUDA kernel execution time and CPU time, as well as 2) memory usage.
+# For 1) use `nsys profile` to run, for 2) run regularly
 #
 # Run the code:
 # uv run cs336_systems/benchmark.py
@@ -97,8 +99,9 @@ MODEL_CONFIG_XL_SC = {
 }
 
 model_config = MODEL_CONFIG_M
-enable_mixed_precision = True
-inference_only = True
+enable_mixed_precision = False
+inference_only = False
+enable_torch_compile = True
 
 
 @nvtx.range("training loop")
@@ -125,6 +128,9 @@ def main():
       num_heads=model_config["num_heads"],
       d_ff=model_config["d_ff"],
     ).to(DEVICE)
+
+    if enable_torch_compile:
+      lm = torch.compile(lm)
 
     optim = optimizer.AdamW(lm.parameters(), lr=1e-3)
 
@@ -160,9 +166,9 @@ def main():
 
     # Save and finish the memory recording
     memory_history_file_name = (
-      "memory_profile_fwd_bwd_optim_mixed_precision.pickle"
+      "memory_profile_fwd_bwd_optim_torch_compile.pickle"
       if not inference_only
-      else "memory_profile_fwd_mixed_precision.pickle"
+      else "memory_profile_fwd_torch_compile.pickle"
     )
     torch.cuda.memory._dump_snapshot(memory_history_file_name)
     torch.cuda.memory._record_memory_history(enabled=None)
