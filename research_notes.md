@@ -578,3 +578,98 @@ Input tensor size: `[4, 512, 1280]` × 4 bytes = 10,485,760 bytes ≈ 0.01 GB pe
 **Key takeaway:** BLOCKS_36 (one big checkpoint) peaks at 13 GB — the entire forward is recomputed inside backward, materializing all 36 blocks' activations simultaneously. BLOCKS_1 (one block per segment) peaks at only 1 GB — during backward, only one block's activations are live at a time (recomputed, used for grad, freed). The peak is dominated by that one recomputed block, not the full model.
 
 This is the fundamental memory–compute tradeoff of gradient checkpointing: finer granularity (smaller segments) reduces peak memory but multiplies recompute work, since each segment is recomputed once during backward.
+
+---
+
+## CPU/GPU Time Profiling (`torch.profiler`)
+
+**Setup:** `torch.profiler.profile` with CPU + CUDA activities, 1 warmup iteration. Operations run on 1D tensors of size 2048.
+
+**Note on CUDA total double-counting:** The `CUDA total` column for CPU-side ops (e.g. `aten::add`, `aten::dot`) is inflated 2× relative to actual GPU time. The same kernel duration is attributed both directly to the op and again via the `Activity Buffer Request` child event. The correct GPU time is the `Self CUDA` value on the raw kernel rows (e.g. `vectorized_elementwise_kernel`, `dot_kernel`), or equivalently the `Self CUDA time total` footer.
+
+### Baseline: Sleep (no operation)
+
+```
+---------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                       Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls
+---------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+      cudaDeviceSynchronize         0.78%      21.531us         0.78%      21.531us      10.766us             2
+    Activity Buffer Request        99.22%       2.734ms        99.22%       2.734ms       2.734ms             1
+---------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.755ms
+```
+
+No GPU work. Total CPU time ~2.8 ms — almost entirely the profiler's CUDA activity buffer flush. This is the instrumentation floor present in every run.
+
+### Add function (`aten::add`, dim=2048)
+
+```
+Self CPU time total: 2.101ms    Self CUDA time total: 1.920us
+
+aten::add            Self CPU: 53 μs   Self CUDA: 1.920 μs
+Activity Buffer Req  Self CPU: 1.958ms  Self CUDA: 1.920 μs  (profiler overhead)
+vectorized_elementwise_kernel (CUDAFunctor_add)  Self CUDA: 1.920 μs
+cudaLaunchKernel     Self CPU: 21 μs
+cudaDeviceSynchronize Self CPU: 68 μs
+```
+
+One GPU kernel dispatched. Actual GPU work: **1.920 μs**.
+
+### MatMul / dot product (`aten::dot`, dim=2048) — run 1
+
+```
+Self CPU time total: 2.722ms    Self CUDA time total: 3.840us
+
+aten::dot            Self CPU: 228 μs  Self CUDA: 3.840 μs
+Activity Buffer Req  Self CPU: 2.438ms Self CUDA: 3.840 μs  (profiler overhead)
+dot_kernel           Self CUDA: 2.016 μs  (52.5%)
+reduce_1Block_kernel Self CUDA: 1.824 μs  (47.5%)
+cudaLaunchKernel     Self CPU: 27 μs  (2 calls)
+```
+
+Two cuBLAS kernels dispatched. Actual GPU work: **3.840 μs** (2.016 + 1.824).
+
+### MatMul / dot product (`aten::dot`, dim=2048) — run 2
+
+```
+Self CPU time total: 3.026ms    Self CUDA time total: 4.352us
+
+aten::dot            Self CPU: 25 μs   Self CUDA: 4.352 μs
+Activity Buffer Req  Self CPU: 2.558ms Self CUDA: 4.352 μs  (profiler overhead)
+dot_kernel           Self CUDA: 2.336 μs  (53.7%)
+reduce_1Block_kernel Self CUDA: 2.016 μs  (46.3%)
+cudaLaunchKernel     Self CPU: 359 μs  (2 calls — CPU jitter spike)
+```
+
+### Key observations
+
+- **`Activity Buffer Request` (~2–2.7 ms) is the profiler floor** — present even in Sleep with no GPU work. It dominates 80–99% of reported CPU time and is pure instrumentation cost; ignore it when reasoning about real performance.
+- **Actual GPU kernel time is ~2–4 μs** for these 2048-element ops. The GPU is barely utilized at this scale.
+- **`aten::add` dispatches 1 kernel; `aten::dot` dispatches 2** — `dot_kernel` (main multiply-accumulate) and `reduce_1Block_kernel` (final partial-sum reduction). The reduction adds ~47% overhead vs. a pure elementwise op.
+- **`cudaLaunchKernel` CPU time is ~20–27 μs normally but can spike to ~360 μs** (run 2) due to OS scheduler jitter. This is the dominant variable in CPU-side dispatch cost.
+- **`aten::dot` CPU self time (228 μs run 1 vs. 25 μs run 2)** shows similar jitter in the PyTorch dispatch path itself — the two runs are the same operation with no algorithmic difference.
+
+### `torch.cdist` (pairwise Euclidean distance)
+
+```
+Self CUDA time total: 1.172ms
+
+aten::mm + ampere_sgemm_128x64_tn   Self CUDA: 834 μs   (71.2%)
+aten::cat + CatArrayBatchedCopy     Self CUDA:  87 μs   ( 7.4%)
+aten::pow + vectorized_elementwise  Self CUDA:  78 μs   ( 6.6%)
+aten::sum + reduce_kernel           Self CUDA:  48 μs   ( 4.1%)
+aten::sqrt_ + sqrt_kernel           Self CUDA:  42 μs   ( 3.6%)
+```
+
+**Algorithm:** `cdist` does not compute differences elementwise. Instead it uses the identity:
+
+```
+||x - y||² = ||x||² + ||y||² - 2 · x·yᵀ
+```
+
+- `pow` + `sum` — compute per-row squared norms ||x||² and ||y||²
+- `mm` — compute the cross-term matrix x·Yᵀ  (one matmul over all pairs at once)
+- combine norms and cross-terms, then `sqrt_` in-place
+- `cat` — concatenate intermediate norm vectors before combining
+
+**Key takeaway:** 71% of GPU time is the single `ampere_sgemm_128x64_tn` matmul. The norm computation (pow+sum+sqrt) adds ~14% total. `cdist` is effectively a matmul — the pairwise distance structure collapses into a single GEMM via the algebraic identity, which is why it can be highly efficient on GPU despite computing O(N²) distances.
