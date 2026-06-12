@@ -673,3 +673,69 @@ aten::sqrt_ + sqrt_kernel           Self CUDA:  42 μs   ( 3.6%)
 - `cat` — concatenate intermediate norm vectors before combining
 
 **Key takeaway:** 71% of GPU time is the single `ampere_sgemm_128x64_tn` matmul. The norm computation (pow+sum+sqrt) adds ~14% total. `cdist` is effectively a matmul — the pairwise distance structure collapses into a single GEMM via the algebraic identity, which is why it can be highly efficient on GPU despite computing O(N²) distances.
+
+### Softmax (`aten::softmax`, dim=2048)
+
+```
+Self CUDA time total: 105.854us
+
+aten::add              Self CUDA: 60.959 μs  (57.59%)
+  vectorized_elementwise_kernel (CUDAFunctor_add)       Self CUDA: 60.959 μs
+aten::_softmax         Self CUDA: 44.895 μs  (42.41%)
+  softmax_warp_forward<float, float, float, 11, false>  Self CUDA: 44.895 μs
+cudaLaunchKernel       Self CPU: 364 μs  (2 calls)
+cudaDeviceSynchronize  Self CPU:   8 μs  (2 calls)
+```
+
+Two GPU kernels dispatched. Actual GPU work: **105.854 μs**.
+
+**Key observations:**
+
+- **Same add-vs-activation pattern as gelu:** add (binary, 3N bytes) is ~1.36× slower than softmax (unary, 2N bytes), for the same memory-bandwidth-bound reason.
+- **`softmax_warp_forward<float, float, float, 11, false>`:** the template parameter `11 = log₂(2048)` encodes the row length. PyTorch selects a warp-specialized kernel based on the softmax dimension size — each warp handles one row of 2^11 elements using warp-level shuffle reductions (no shared memory needed), making a single-pass fused max+exp+sum+divide.
+- **Softmax dispatches only 1 kernel** despite being a 3-step computation (max reduction, exp, normalize). The warp-forward kernel fuses all steps, unlike `aten::dot` which dispatches 2 kernels. This fusion matters at larger T where a naive 3-pass softmax would read the T×T attention matrix 3× from HBM.
+- **GPU time is nearly identical to gelu (103 μs vs 106 μs)** — both are bandwidth-bound with the same add overhead.
+
+---
+
+### MLP block (`aten::mm` + gelu + add + dropout)
+
+```
+Self CUDA time total: 948.447us
+
+aten::mm (ampere_sgemm_128x64_tn)     Self CUDA: 826.207 μs  (87.11%)
+aten::add (CUDAFunctor_add)            Self CUDA:  60.480 μs  ( 6.38%)
+aten::gelu (GeluCUDAKernelImpl)        Self CUDA:  40.352 μs  ( 4.25%)
+aten::uniform_ (distribution_grid)     Self CUDA:  21.408 μs  ( 2.26%)
+Memset (Device)                        Self CUDA:   0.832 μs  ( 0.09%)
+```
+
+**Key observations:**
+
+- **The matmul (`aten::mm`) consumes 87% of MLP GPU time.** Add + gelu + dropout together account for only ~13%. At realistic model sizes the MLP block is overwhelmingly compute-bound by the linear projection.
+- **`aten::uniform_` is the dropout random-number kernel.** It uses a grid-stride distribution kernel to fill the dropout mask in-place. At 2.26% it is non-trivial; at larger batch/sequence sizes it could become more significant.
+- **`Memset (Device)` (0.09%)** zeroes the dropout mask buffer before `uniform_` fills it.
+- **Add and gelu retain their relative sizes from the isolated benchmarks** (add ≈ 1.5× gelu), confirming they are still memory-bandwidth-bound and unaffected by the surrounding matmul context.
+- **This directly explains why shortening context length doesn't speed up MODEL_CONFIG_S:** the MLP block is 87% matmul, whose flop count is `2·B·T·d_model·d_ff` — linear in T. But the matmul at small model sizes is already occupying nearly all GPU SM throughput, so the ~4× reduction in T only yields ~4× fewer flops with near-proportional time savings. The attention block, which scales as T², is a small fraction of total time at MODEL_CONFIG_S sizes — so reducing T gives diminishing returns relative to the fixed MLP cost per token.
+
+### GELU activation (`aten::gelu` + `aten::add`)
+
+```
+Self CUDA time total: 103.072us
+
+aten::add              Self CUDA: 60.256 μs  (58.46%)
+  vectorized_elementwise_kernel (CUDAFunctor_add)  Self CUDA: 60.256 μs
+aten::gelu             Self CUDA: 42.816 μs  (41.54%)
+  vectorized_elementwise_kernel (GeluCUDAKernelImpl)  Self CUDA: 42.816 μs
+cudaLaunchKernel       Self CPU: 351 μs  (2 calls)
+cudaDeviceSynchronize  Self CPU:  39 μs  (2 calls)
+```
+
+Two GPU kernels dispatched. Actual GPU work: **103.072 μs** (60.256 + 42.816).
+
+**Key observations:**
+
+- **`aten::add` (60.3 μs, 58%) is more expensive than `aten::gelu` (42.8 μs, 42%)** despite GELU being a more complex transcendental computation. Both are elementwise kernels over the same tensor size, so they are both memory-bandwidth-bound — the runtime difference reflects GELU's more complex per-element work (erf/tanh approximation) being offset by its slightly smaller share.
+- **Both ops dispatch a single `vectorized_elementwise_kernel`** — PyTorch uses the same vectorized kernel template for both simple adds and complex activation functions, with the math functor as a template parameter.
+- **`cudaLaunchKernel` CPU overhead: ~175 μs per kernel** (351 μs / 2 calls) — substantially higher than the ~20–27 μs seen for add/dot in isolation. This is likely a combination of profiler overhead and the fact that GELU requires more CUDA driver setup for the transcendental math path.
+- **Ratio: add is ~1.41× slower than gelu on GPU** — because both are memory-bandwidth-bound, and `add` (binary op) moves **50% more data** than `gelu` (unary op): add reads 2 tensors + writes 1 = 3N bytes vs. gelu reads 1 + writes 1 = 2N bytes. The ~1.41× runtime gap tracks the ~1.5× memory traffic ratio. GELU's extra transcendental arithmetic (erf/tanh approximation) is irrelevant — the GPU hides it entirely while waiting for HBM fetches. For memory-bound elementwise kernels, **op arity (how many tensors are read) matters; arithmetic complexity does not**.
