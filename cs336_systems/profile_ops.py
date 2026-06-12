@@ -1,7 +1,7 @@
 # Profile CPU & GPU for various ops
 #
 # Run the code:
-# uv run cs336_systems/profile.py
+# uv run cs336_systems/profile_ops.py
 
 import time
 import torch

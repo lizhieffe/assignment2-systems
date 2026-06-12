@@ -718,6 +718,34 @@ Memset (Device)                        Self CUDA:   0.832 μs  ( 0.09%)
 - **Add and gelu retain their relative sizes from the isolated benchmarks** (add ≈ 1.5× gelu), confirming they are still memory-bandwidth-bound and unaffected by the surrounding matmul context.
 - **This directly explains why shortening context length doesn't speed up MODEL_CONFIG_S:** the MLP block is 87% matmul, whose flop count is `2·B·T·d_model·d_ff` — linear in T. But the matmul at small model sizes is already occupying nearly all GPU SM throughput, so the ~4× reduction in T only yields ~4× fewer flops with near-proportional time savings. The attention block, which scales as T², is a small fraction of total time at MODEL_CONFIG_S sizes — so reducing T gives diminishing returns relative to the fixed MLP cost per token.
 
+### GeLU implementation comparison (`profile_different_gelu.py`, dim=2048)
+
+**Setup:** 1D tensor of shape `[2048]`, 1 warmup iteration. Five implementations compared.
+
+| Implementation | CUDA kernels | Self CUDA time | Notes |
+|---|---|---|---|
+| `pytorch_gelu` (`F.gelu`) | 1 | **41.215 µs** | Built-in fused `GeluCUDAKernelImpl` |
+| `manual_gelu` (eager, no compile) | 9 | **452.221 µs** | Separate mul/add/tanh/mul kernels |
+| `manual_gelu_torch_compile` | 1 | **42.176 µs** | Triton fused: `triton_poi_fused_add_mul_tanh_0` |
+| `manual_gelu_with_pow` (eager) | ~8 | **370.853 µs** | Same as manual_gelu + extra pow kernel |
+| `cuda_gelu` (custom CUDA kernel) | 1 | **49.441 µs** | Hand-written `gelu_kernel(float*, float*, int)` |
+
+**Key observations:**
+
+- **All single-kernel implementations (~41–49 µs) perform equivalently.** `pytorch_gelu`, `torch.compile`, and the custom CUDA kernel all take essentially the same wall-clock GPU time. The operation is memory-bandwidth-bound at this size — one pass over the tensor at ~900 GB/s for 2×2048×4 bytes ≈ 16 KB takes ~18 ns in principle, but kernel launch overhead and profiler effects bring observed time to ~40–50 µs.
+
+- **Eager Python `manual_gelu` is 11× slower (452 µs)** despite identical arithmetic. It dispatches 9 separate kernels (6× mul, 2× add, 1× tanh) — each kernel independently reads and writes the full tensor from HBM. Each round-trip is ~41–62 µs at this size, and 9 kernels multiply that. The compute itself is trivial; the bottleneck is memory traffic from kernel fragmentation.
+
+- **`torch.compile` recovers all the lost performance** by fusing the 9-op eager graph into a single Triton kernel (`triton_poi_fused_add_mul_tanh_0`). The result is indistinguishable from a hand-written CUDA kernel or PyTorch's built-in. This demonstrates the primary value of `torch.compile` for pointwise op chains: not smarter math, but elimination of redundant HBM round-trips.
+
+- **`manual_gelu_with_pow` is slightly faster than `manual_gelu` (370 µs vs 452 µs)** despite having an extra `aten::pow` call. The pow kernel replaces the 3× `aten::mul` chain for `x³`, which PyTorch dispatches as three separate binary mul kernels (9 total for manual_gelu vs. ~8 for with_pow). The trade-off: `aten::pow` is a single kernel for `x³`, but dispatches its own overhead; net effect is slightly fewer kernel launches.
+
+- **Custom CUDA kernel is 20% slower than pytorch_gelu (49 µs vs 41 µs)** — likely attributable to: (1) `tanhf` in CUDA is slightly more expensive than PyTorch's `erf`-based GELU approximation used by `GeluCUDAKernelImpl`; (2) no `--use_fast_math` flag; (3) minor block-size tuning differences. Still well within the memory-bandwidth-bound regime — the gap is not algorithmic.
+
+- **The lesson:** for pointwise operations over small-to-medium tensors, implementation efficiency is dominated by the number of kernel dispatches (memory-bandwidth-bound), not arithmetic complexity. Writing a custom CUDA kernel achieves the same result as `torch.compile` but requires more effort. For any chain of pointwise ops, `torch.compile` is the zero-effort path to optimal performance.
+
+---
+
 ### GELU activation (`aten::gelu` + `aten::add`)
 
 ```

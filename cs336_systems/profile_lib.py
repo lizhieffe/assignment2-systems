@@ -53,6 +53,12 @@ def profile(
     prof.export_stacks(text_path, "self_cuda_time_total")
 
 
+def run_operation1(dim: int, fn: Callable, device: str = "cpu") -> Callable:
+  """Helper fn to run an op requires two 2D metrics input."""
+  a = torch.rand((dim, dim)).to(device)
+  return functools.partial(fn, a)
+
+
 def run_operation2(dim: int, fn: Callable, device: str = "cpu") -> Callable:
   """Helper fn to run an op requires two 2D metrics input."""
   a = torch.rand((dim, dim)).to(device)

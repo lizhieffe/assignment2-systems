@@ -163,6 +163,10 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# clangd / IDE tooling
+.clangd
+compile_commands.json
+
 # NVIDIA Nsight Systems
 *.nsys-rep
 report*.sqlite
