@@ -15,7 +15,7 @@ __global__ void gelu_kernel(float* in, float* out, int num_elements) {
   }
 }
 
-// Compute ceil(a/b)
+// Utility: Compute ceil(a/b)
 inline unsigned int cdiv(unsigned int a, unsigned int b) {
   return (a + b - 1) / b;
 }
