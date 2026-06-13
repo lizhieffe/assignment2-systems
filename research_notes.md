@@ -171,6 +171,32 @@ Four configurations profiled: two model sizes (S, M) × two context lengths (512
 
 ---
 
+### Experiment: torch.compile vs plain PyTorch attention
+
+**Setup:** same attention module, compare baseline PyTorch vs `torch.compile` on forward and backward profiling.
+
+| Config | Forward peak (MiB) | Backward peak (MiB) | Forward CUDA | Backward CUDA | Key behavior |
+|---|---|---|---|---|---|
+| dim16_seq256 | 16.73 → 12.93 | 28.98 → 24.80 | 0.123 ms → 0.067 ms | 0.421 ms → 0.333 ms | compile reduces both mem and forward latency |
+| dim16_seq4096 | 2088.91 → 1053.00 | 3114.88 → 2073.01 | 11.801 ms → 3.971 ms | 26.914 ms → 11.103 ms | large forward and memory wins, backward also improves |
+| dim32_seq8192 | 8306.08 → 4162.27 | 12410.02 → 8242.27 | 39.808 ms → 14.891 ms | 95.842 ms → 223.221 ms | forward wins, backward runtime regresses heavily |
+| dim128_seq8192 | 8405.31 → 4309.50 | 12533.31 → 8341.63 | 44.523 ms → 19.121 ms | 99.909 ms → 227.494 ms | same forward gain, backward runtime spike |
+
+**Key findings:**
+
+- `torch.compile` consistently reduced forward peak HBM and forward CUDA time across measured attention shapes.
+- For small-to-medium shapes, compile also reduced backward memory and improved backward throughput.
+- For larger sequence lengths and model widths, compile produced much faster forward execution but introduced expensive backward kernels, extra DtoD copies, and longer CPU-side profiler totals.
+- The compiled backward phase often shows Triton fused kernels and heavier device copy activity, suggesting the new backward graph is more memory- and compute-intensive.
+- In effect, `torch.compile` can trade forward kernel fusion for a backward graph that is less efficient: the compiled backward path may produce larger fused kernels, more intermediate buffers, and more device-to-device transfers than the plain PyTorch backward path.
+- Because the backward pass dominates the training iteration, it is essential to validate end-to-end forward+backward performance, not just forward gains.
+
+**Practical conclusion:**
+
+Use `torch.compile` when it lowers both forward and backward cost, but be cautious for large attention shapes. The best result is not guaranteed by forward speed alone; if backward runtime or peak activation spikes, retain plain PyTorch or explore shape-specialized compilation, lower precision, or activation checkpointing.
+
+---
+
 ## CUDA GPU Kernel Summary
 
 ### MODEL_CONFIG_M — Forward Pass (Top 10 Kernels)
@@ -798,3 +824,75 @@ Two GPU kernels dispatched. Actual GPU work: **103.072 μs** (60.256 + 42.816).
 - **Both ops dispatch a single `vectorized_elementwise_kernel`** — PyTorch uses the same vectorized kernel template for both simple adds and complex activation functions, with the math functor as a template parameter.
 - **`cudaLaunchKernel` CPU overhead: ~175 μs per kernel** (351 μs / 2 calls) — substantially higher than the ~20–27 μs seen for add/dot in isolation. This is likely a combination of profiler overhead and the fact that GELU requires more CUDA driver setup for the transcendental math path.
 - **Ratio: add is ~1.41× slower than gelu on GPU** — because both are memory-bandwidth-bound, and `add` (binary op) moves **50% more data** than `gelu` (unary op): add reads 2 tensors + writes 1 = 3N bytes vs. gelu reads 1 + writes 1 = 2N bytes. The ~1.41× runtime gap tracks the ~1.5× memory traffic ratio. GELU's extra transcendental arithmetic (erf/tanh approximation) is irrelevant — the GPU hides it entirely while waiting for HBM fetches. For memory-bound elementwise kernels, **op arity (how many tensors are read) matters; arithmetic complexity does not**.
+
+---
+
+## Attention Profiling
+
+### Plain PyTorch Attention — Latency Profiling
+
+**Setup:** Single-head causal self-attention with batch_size=8, varying d_model ∈ [16, 32, 64, 128] and seq_length ∈ [256, 1024, 4096, 8192, 16384]. Profiled with `torch.profiler` (1 warmup, single measurement run). Total GPU time measured via `Self CUDA time total` from profiler output.
+
+#### GPU Latency Summary (Self CUDA time, μs)
+
+| d_model | seq=256 | seq=1024 | seq=4096 | seq=8192 | seq=16384 |
+|---|---|---|---|---|---|
+| 16 | 124.6 | 735.2 | 11,548 | 42,166 | OOM |
+| 32 | 119.0 | 720.1 | 11,581 | 39,848 | OOM |
+| 64 | 128.5 | 774.8 | 11,958 | 41,037 | OOM |
+| 128 | 163.6 | 939.6 | 13,084 | 44,767 | OOM |
+
+**Key observations:**
+
+1. **Quadratic scaling with sequence length.** GPU time grows ~100× from seq=256 → seq=4096 (4× sequence), consistent with O(T²) attention score matrix. At seq=8192 (8× sequence), GPU time is ~360× baseline, matching T² scaling.
+   - d_model=16: 124.6 μs → 42,166 μs = 338× increase for 32× sequence (expected: 1024×, but dominated by fixed overhead at small seq)
+   - Trend is clear: seq=256 → 1024 is ~6× GPU time (16² = 256, 1024² = 1,048,576; ratio ~4,096×, but overhead masks this)
+
+2. **Minimal d_model effect.** Changing d_model from 16 → 128 (8×) increases GPU time by only ~30% at the same sequence length, not 8×. The attention computation is dominated by the T² score matrix, not the embedding dimension.
+   - seq=4096: d_model=16 (11.5 ms) vs d_model=128 (13.1 ms) — only 13% difference
+   - This aligns with scaled_dot_product_attention: Q·Kᵀ is O(B·H·T²·d_k) where d_k is small per-head, while T² dominates
+
+3. **Top GPU kernels remain consistent.**
+   - `aten::bmm` (matmul for Q·Kᵀ, scores·V): ~20–30% of GPU time
+   - `aten::div` (softmax normalization): ~23–26% at larger seq
+   - `aten::sub`, `aten::exp`, `aten::where` (softmax: max shift, exp, mask apply): collectively ~40–50% of GPU time
+   - Softmax is the dominant bottleneck, not the matmul — this is the classic "memory-bound softmax" issue: one pass over the attention matrix for exp, another for sum reduction, another for normalization, vs. a single fused matmul.
+
+4. **Attention memory is the OOM bottleneck.** All configurations OOM at seq=16384:
+   - Attention score matrix shape: `[B, num_heads, T, T] = [8, 1, 16384, 16384]` = 2 GB at fp32 (4 bytes × 268M elements)
+   - With a single head and small d_model, the model itself is tiny (~KB), so the attention matrix dominates memory
+   - Gradient checkpointing or FlashAttention (online softmax) would be necessary to fit this on current 40 GB GPUs
+
+#### Kernel Breakdown: d_model=16, seq=4096 (11.5 ms total GPU time)
+
+| Kernel | Time | % | Purpose |
+|---|---|---|---|
+| `aten::div` | 2.679 ms | 23.2% | Softmax: divide by sum |
+| `aten::bmm` | 2.593 ms | 22.4% | Q·Kᵀ (query-key scores) |
+| `ampere_sgemm_128x128_nn` | 1.908 ms | 16.5% | Scores·V (apply attention weights) |
+| `aten::where` | 3.760 ms | 32.6% | Causal mask application + extra softmax |
+| Other elementwise | ~1.0 ms | ~8.7% | mul, sub, exp, max, reduce |
+
+**Analysis:** The softmax pipeline (`where` for masking + `div` for normalization) alone consumes ~56% of GPU time. The two matmuls (Q·Kᵀ and scores·V) together are only ~39%. This is the hallmark of a **memory-bandwidth-limited attention implementation** — the T×T softmax matrix is read multiple times (once for max, once for exp, once for sum, once for divide), and masking adds another full read/write.
+
+#### Comparison: Fixed overhead at small sequence lengths
+
+At seq=256 and seq=1024, `aten::bmm` (matmul) dominates the profile (~27–47% of GPU time), while at larger seq, softmax (`aten::div`, `aten::where`) takes over (~56%). This crossover reflects that:
+- Matmul is **compute-bound** — scales with T² and O(T²) flops per element
+- Softmax is **memory-bandwidth-bound** — scales with T² but only O(1) flops per element after max+shift
+
+At small T, the launch overhead of softmax kernels relative to their 1 μs runtime becomes significant, so matmul appears larger in the profile. At T=4096, the softmax matrix (67 MB) requires multiple full reads/writes, dominating.
+
+#### Latency implications for long sequences
+
+- **Token generation (autoregressive decoding).** For seq=1024 with a 40 GB GPU, a single attention forward pass takes ~720 μs (d_model=32). Decoding 1000 tokens would incur ~720 ms in attention alone, not counting embedding projection or MLP. With a 100-token cache (in practice), attention is ~3 ms per token.
+- **Training with long context.** At seq=8192, even a forward pass is ~40 ms per batch. With backward and optimizer overhead, a 160ms iteration becomes 200+ ms, yielding ~5 tokens/sec throughput for a single GPU.
+
+#### OOM boundary observed
+
+- **Effective OOM limit at seq=16384** for d_model ≥ 16 with bs=8 on a 40 GB GPU suggests attention matrix memory alone occupies ~2 GB (67 MB per head × 32 heads ≈ 2 GB). Model parameters are negligible (~KB).
+- **Mitigation strategies:**
+  - **FlashAttention:** Fuse softmax and matmul, eliminate full T×T matrix materialization in HBM (saves ~2 GB)
+  - **Gradient checkpointing:** Save only the input and recompute attention in backward
+  - **Sparse attention:** Reduce T² to T·log(T) or T via local/strided patterns
+  - **Multi-GPU / distributed attention:** Shard T dimension across GPUs

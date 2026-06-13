@@ -10,6 +10,7 @@ def profile(
   description: str,
   fn: Callable,
   num_warmups: int = 1,
+  profile_memory: bool = False,
   with_stack: bool = False,
 ):
   """Profile the CPU + GPU time of fn and print a summary table.
@@ -37,7 +38,7 @@ def profile(
         torch.profiler.ProfilerActivity.CUDA,
       ],
       record_shapes=False,
-      profile_memory=False,
+      profile_memory=profile_memory,
       with_stack=with_stack,
     ) as prof:
       fn()
