@@ -109,7 +109,9 @@ def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
   block_start = pid * BLOCK_SIZE
 
   # Indicate where this thread block should operate.
-  offset = block_start + tl.arange(0, BLOCK_SIZE)
+  #
+  # In Triton, it thinks about thread blocks, instead of individual threads.
+  offset = block_start + tl.arange(0, BLOCK_SIZE)  # For a thread block (vector, not scalar)
 
   # Handle boundary
   mask = offset < num_elements
