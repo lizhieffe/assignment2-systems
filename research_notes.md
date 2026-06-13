@@ -153,6 +153,24 @@ Four configurations profiled: two model sizes (S, M) × two context lengths (512
 
 ---
 
+### Experiment: GeLU Kernel Profiling
+
+**Setup:** single call of each GPU GeLU variant, profiling with CUDA/Nsight-style breakdown
+
+| Variant | Self CPU time | Self CUDA time | Kernel | Kernel time | Launch/sync overhead |
+|---|---|---|---|---|---|
+| `cuda_gelu` | 634.848 µs | 50.654 µs | `gelu_kernel(float*, float*, int)` | 50.654 µs | `cudaLaunchKernel` 315.359 µs + `cudaDeviceSynchronize` 115.043 µs |
+| `triton_gelu` | 586.368 µs | 40.319 µs | `triton_gelu_kernel` | 40.319 µs | `cuLaunchKernelEx` 295.349 µs + `cudaDeviceSynchronize` 19.791 µs |
+
+**Observations:**
+- The Triton kernel is measurably faster than the handwritten CUDA kernel, with `triton_gelu_kernel` at ~40.3 µs vs `gelu_kernel` at ~50.7 µs.
+- Both variants incur significant non-kernel overhead from tensor allocation and GPU launch/synchronization; the kernel-only portion is a small fraction of total wall time.
+- `cuda_gelu` spends more time in `cudaDeviceSynchronize` (115 µs vs 20 µs for Triton), suggesting the Triton path has lower blocking overhead in this profile.
+- The allocation path (`aten::empty_like`, `aten::empty_strided`) is also visible in both cases, but the execution-level advantage belongs to Triton for this GeLU workload.
+- If the goal is pure kernel performance for a simple elementwise activation, Triton appears to be the better choice here, though overall GPU timing still depends on launch/sync costs.
+
+---
+
 ## CUDA GPU Kernel Summary
 
 ### MODEL_CONFIG_M — Forward Pass (Top 10 Kernels)
@@ -743,6 +761,19 @@ Memset (Device)                        Self CUDA:   0.832 μs  ( 0.09%)
 - **Custom CUDA kernel is 20% slower than pytorch_gelu (49 µs vs 41 µs)** — likely attributable to: (1) `tanhf` in CUDA is slightly more expensive than PyTorch's `erf`-based GELU approximation used by `GeluCUDAKernelImpl`; (2) no `--use_fast_math` flag; (3) minor block-size tuning differences. Still well within the memory-bandwidth-bound regime — the gap is not algorithmic.
 
 - **The lesson:** for pointwise operations over small-to-medium tensors, implementation efficiency is dominated by the number of kernel dispatches (memory-bandwidth-bound), not arithmetic complexity. Writing a custom CUDA kernel achieves the same result as `torch.compile` but requires more effort. For any chain of pointwise ops, `torch.compile` is the zero-effort path to optimal performance.
+
+#### CUDA vs Triton custom GeLU profiling
+
+| Variant | Self CPU time | Self CUDA time | Kernel | Kernel time | Launch/sync overhead |
+|---|---|---|---|---|---|
+| `cuda_gelu` | 634.848 µs | 50.654 µs | `gelu_kernel(float*, float*, int)` | 50.654 µs | `cudaLaunchKernel` 315.359 µs + `cudaDeviceSynchronize` 115.043 µs |
+| `triton_gelu` | 586.368 µs | 40.319 µs | `triton_gelu_kernel` | 40.319 µs | `cuLaunchKernelEx` 295.349 µs + `cudaDeviceSynchronize` 19.791 µs |
+
+**Additional observations:**
+- Triton's kernel is faster than the handwritten CUDA kernel on this benchmark, with `triton_gelu_kernel` running in ~40.3 µs vs `gelu_kernel` at ~50.7 µs.
+- Both implementations show significant dispatch/synchronization overhead; the kernel-only time is a small fraction of the overall CPU-side profile.
+- `cuda_gelu` has higher synchronize overhead than `triton_gelu`, suggesting the Triton path can be more efficient for the full-profile call.
+- This reinforces the teardown in the table above: the fastest GeLU implementations are the ones that minimize kernel dispatches and fuse work into a single GPU kernel.
 
 ---
 

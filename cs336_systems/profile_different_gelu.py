@@ -1,9 +1,12 @@
-# Profile CPU & GPU for various ops
+# Profile CPU & GPU for various implementation of GeLU, from
+# naive python impl to more advanced CUDA & Triton impls.
 #
 # Run the code:
 # uv run cs336_systems/profile_different_gelu.py
 
 import os
+import triton
+import triton.language as tl
 import torch
 import torch.utils.cpp_extension as _cpp_ext
 from torch.utils.cpp_extension import load_inline
@@ -71,6 +74,59 @@ def create_cuda_gelu():
   return module.gelu
 
 
+def triton_gelu(x: torch.Tensor) -> torch.Tensor:
+  assert x.is_cuda
+  assert x.is_contiguous
+
+  # Allocate output tensor
+  y = torch.empty_like(x)
+
+  # Determine grid (elements divided into blocks)
+  num_elements = x.numel()
+  block_size = 1024  # num of threads
+  num_blocks = triton.cdiv(num_elements, block_size)
+
+  # Invoke GPU kernel
+  triton_gelu_kernel[(num_blocks,)](
+    x, y, num_elements=num_elements, BLOCK_SIZE=block_size
+  )
+
+  return y
+
+
+@triton.jit
+def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
+  """
+  GPU kernel for triton gelu.
+
+  Args:
+    x_ptr: input
+    y_ptr: output
+    num_elements: total number of elements
+    BLOCK_SIZE: num of threads in each block
+  """
+  pid = tl.program_id(axis=0)
+  block_start = pid * BLOCK_SIZE
+
+  # Indicate where this thread block should operate.
+  offset = block_start + tl.arange(0, BLOCK_SIZE)
+
+  # Handle boundary
+  mask = offset < num_elements
+
+  # Read
+  x = tl.load(x_ptr + offset, mask=mask)
+
+  # Compute
+  a = 0.7978845608 * (x + 0.044715 * x * x * x)
+  exp = tl.exp(2 * a)
+  tanh = (exp - 1) / (exp + 1)
+  y = 0.5 * x * (1 + tanh)
+
+  # Write
+  tl.store(y_ptr + offset, y, mask=mask)
+
+
 def main():
   gpu_lib.print_gpu_specs()
 
@@ -99,6 +155,11 @@ def main():
   profile_lib.profile(
     "cuda_gelu",
     profile_lib.run_operation1(dim=2048, fn=cuda_gelu, device=DEVICE),
+  )
+
+  profile_lib.profile(
+    "triton_gelu",
+    profile_lib.run_operation1(dim=2048, fn=triton_gelu, device=DEVICE),
   )
 
 
