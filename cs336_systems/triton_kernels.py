@@ -57,17 +57,18 @@ def weighted_sum(
 @triton.jit
 def weighted_sum_kernel(
   x_ptr,
-  weight_ptr,
-  output_ptr,
+  weight_ptr,  # (N, D)
+  output_ptr,  # (D)
   x_stride_row,
   x_stride_dim,  # Stride tells us how to move one element in each axis of a tensor.
   weight_stride_dim,
   output_stirde_row,
-  NUM_ROWS,
-  D,
+  NUM_ROWS,  # Num of rows for the parent tensor.
+  D,  # Num of columns (embedding dim) for the parent tensor.
   ROWS_TILE_SIZE: tl.constexpr,
   D_TILE_SIZE: tl.constexpr,
 ):
+  """Note: x_ptr input tensor needs to be 2D."""
   # Each thread handles the weighted sum of an **entire** row.
   # Each thread block handles ROWS_TILE_SIZE rows.
   row_tile_idx = tl.program_id(axis=0)
@@ -124,7 +125,200 @@ def weighted_sum_kernel(
       (D_TILE_SIZE,),
     )
 
-    tl.store(output_block_ptr, output, boundary_check=(0,))
+  tl.store(output_block_ptr, output, boundary_check=(0,))
+
+
+@triton.jit
+def weighted_sum_backward_kernel(
+  x_ptr,  # Input
+  weight_ptr,  # Input
+  grad_output_ptr,  # Grad Input
+  grad_x_ptr,  # Grad output
+  partial_grad_weight_ptr,  # Grad output
+  stride_xr,
+  stride_xd,
+  stride_wd,
+  stride_gr,
+  stride_gxr,
+  stride_gxd,
+  stride_gwb,
+  stride_gwd,
+  NUM_ROWS,
+  D,
+  ROWS_TILE_SIZE: tl.constexpr,
+  D_TILE_SIZE: tl.constexpr,
+):
+  row_tile_idx = tl.program_id(axis=0)
+  n_row_tiles = tl.cdiv(NUM_ROWS, ROWS_TILE_SIZE)
+  n_d_tiles = tl.cdiv(D, D_TILE_SIZE)
+
+  # TODO(lizhi): I think having each thread to handle one D is more efficient.
+  # But here we follow the instruction to have each thread to handle one ROW.
+  x_block_ptr = tl.make_block_ptr(
+    base=x_ptr,
+    shape=(NUM_ROWS, D),
+    strides=(stride_xr, stride_xd),
+    offsets=(row_tile_idx * ROWS_TILE_SIZE, 0),
+    block_shape=(ROWS_TILE_SIZE, D_TILE_SIZE),
+    order=(0, 1),
+  )
+  weight_block_ptr = tl.make_block_ptr(
+    base=weight_ptr,
+    shape=(D,),
+    strides=(stride_wd,),
+    offsets=(0,),
+    block_shape=(D_TILE_SIZE,),
+    order=(0,),
+  )
+  grad_output_block_ptr = tl.make_block_ptr(
+    base=grad_output_ptr,
+    shape=(NUM_ROWS,),
+    strides=(stride_gr,),
+    offsets=(row_tile_idx * ROWS_TILE_SIZE,),
+    block_shape=(ROWS_TILE_SIZE,),
+    order=(0,),
+  )
+  grad_x_block_ptr = tl.make_block_ptr(
+    base=grad_x_ptr,
+    shape=(NUM_ROWS, D),
+    strides=(stride_gxr, stride_gxd),
+    offsets=(row_tile_idx * ROWS_TILE_SIZE, 0),
+    block_shape=(ROWS_TILE_SIZE, D_TILE_SIZE),
+    order=(0, 1),
+  )
+  partial_grad_weight_block_ptr = tl.make_block_ptr(
+    base=partial_grad_weight_ptr,
+    shape=(n_row_tiles, D),
+    strides=(stride_gwb, stride_gwd),
+    offsets=(row_tile_idx, 0),
+    block_shape=(1, D_TILE_SIZE),
+    order=(0, 1),
+  )
+
+  for i in range(n_d_tiles):
+    grad_output = tl.load(
+      grad_output_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (ROWS_TILE_SIZE,)
+
+    # Calculate the grad for x
+    weight = tl.load(
+      weight_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (D_TILE_SIZE,)
+    grad_x_row = (
+      grad_output[:, None] * weight[None, :]
+    )  # (ROWS_TILE_SIZE, D_TILE_SIZE)
+    tl.store(grad_x_block_ptr, grad_x_row, boundary_check=(0, 1))
+
+    # Calculate the grad for w
+    row = tl.load(
+      x_block_ptr, boundary_check=(0, 1), padding_option="zero"
+    )  # (ROWS_TILE_SIZE, D_TILE_SIZE)
+    grad_weight_row = grad_output[None, :] @ row  # (1, D_TILE_SIZE)
+    tl.store(
+      partial_grad_weight_block_ptr, grad_weight_row, boundary_check=(1,)
+    )
+
+    # Advance the blocks.
+    x_block_ptr.advance((0, D_TILE_SIZE))
+    weight_block_ptr.advance((D_TILE_SIZE,))
+    grad_x_block_ptr.advance((0, D_TILE_SIZE))
+    partial_grad_weight_block_ptr.advance((0, D_TILE_SIZE))
+
+
+class WeightedSumFunc(torch.autograd.Function):
+  @staticmethod
+  def forward(ctx, x, weight):
+    input_shape = x.shape
+
+    D, output_dim = (
+      input_shape[-1],
+      input_shape[:-1],
+    )  # D is the embedding dimension.
+
+    # Reshape x because the kernel operates on 2-D tensors.
+    x = einops.rearrange(x, "... D -> (...) D")
+
+    ctx.save_for_backward(x, weight)
+
+    assert len(weight.shape) == 1 and output_dim == weight.shape[0], (
+      "Dimension mismatch."
+    )
+    assert x.is_cuda and weight.is_cuda, "Expected CUDA tensors"
+    assert x.is_contiguous(), "X is not contiguous"
+
+    ctx.D_TILE_SIZE = (
+      triton.next_power_of_2(D) // 16
+    )  # Rougly 16 loops through the embedding dimension
+    ctx.ROW_TILE_SIZE = (
+      16  # Each thread block processes 16 batch elements at a time.
+    )
+    ctx.input_shape = input_shape
+
+    num_rows = x.shape[0]
+    num_blocks = triton.cdiv(num_rows, ctx.ROW_TILE_SIZE)
+    y = torch.empty((num_rows,), device=x.device)
+
+    weighted_sum_kernel[(num_blocks,)](
+      x,
+      weight,
+      y,
+      x_stride_row=x.stride()[0],
+      x_stride_dim=x.stride()[1],
+      weight_stride_dim=weight.stride()[0],
+      output_stirde_row=y.stride()[0],
+      NUM_ROWS=num_rows,
+      D=D,
+      ROWS_TILE_SIZE=ctx.ROW_TILE_SIZE,
+      D_TILE_SIZE=ctx.D_TILE_SIZE,
+    )
+
+  @staticmethod
+  def backward(ctx, grad_out):
+    x, weight = ctx.saved_tensors
+
+    assert len(x.shape) == 2, "Wrong x dim"
+    assert len(weight.shape) == 1, "Wrong weight dim"
+    assert len(grad_out.shape) == 1, "Wrong grad_out dim"
+    assert x.shape[0] == grad_out.shape[0], (
+      "Mismatched x & grad_out dimensions."
+    )
+    assert x.shape[1] == weight.shape[0], "Mismatched x & weight dimensions."
+
+    assert grad_out.device == x.device, "Device mismatch between grad_out & x"
+    assert grad_out.device == weight.device, (
+      "Device mismatch between grad_out & weight"
+    )
+    num_rows = x.shape[0]
+    D = x.shape[1]
+
+    num_blocks = triton.cdiv(num_rows, ctx.ROW_TILE_SIZE)
+
+    grad_x = torch.empty_like(x)
+    partial_grad_weight = torch.empty(
+      (num_blocks, D), dtype=x.dtype, device=x.device
+    )
+
+    weighted_sum_backward_kernel[(num_blocks,)](
+      x_ptr=x,
+      weight_ptr=weight,
+      grad_output_ptr=grad_out,
+      grad_x_ptr=grad_x,
+      partial_grad_weight_ptr=partial_grad_weight,
+      stride_xr=x.stride(0),
+      stride_xd=x.stride(1),
+      stride_wd=weight.stride(0),
+      stride_gr=grad_out.stride(0),
+      stride_gxr=grad_x.stride(0),
+      stride_gxd=grad_x.stride(1),
+      stride_gwb=partial_grad_weight.stride(0),
+      stride_gwd=partial_grad_weight.stride(1),
+      NUM_ROWS=num_rows,
+      D=D,
+      ROWS_TILE_SIZE=ctx.ROW_TILE_SIZE,
+      D_TILE_SIZE=ctx.D_TILE_SIZE,
+    )
+
+    return grad_x.view(ctx.input_shape), partial_grad_weight.sum(axis=0)
 
 
 def main() -> None:
