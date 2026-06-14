@@ -15,7 +15,7 @@ from cs336_systems import gpu_lib, profile_lib
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def weighted_sum(
+def weighted_sum_forward(
   x: jaxtyping.Float[torch.Tensor, "... d"],
   weight: jaxtyping.Float[torch.Tensor, "d"],
 ) -> jaxtyping.Float[torch.Tensor, "..."]:
@@ -37,7 +37,7 @@ def weighted_sum(
   # Sum over the last dim or the output doesn't have the last dimension.
   output = torch.empty(num_rows, dtype=x.dtype, device=x.device)
 
-  weighted_sum_kernel[(num_blocks,)](
+  weighted_sum_forward_kernel[(num_blocks,)](
     x,
     weight,
     output,
@@ -55,7 +55,7 @@ def weighted_sum(
 
 
 @triton.jit
-def weighted_sum_kernel(
+def weighted_sum_forward_kernel(
   x_ptr,
   weight_ptr,  # (N, D)
   output_ptr,  # (D)
@@ -130,11 +130,11 @@ def weighted_sum_kernel(
 
 @triton.jit
 def weighted_sum_backward_kernel(
-  x_ptr,  # Input
-  weight_ptr,  # Input
-  grad_output_ptr,  # Grad Input
-  grad_x_ptr,  # Grad output
-  partial_grad_weight_ptr,  # Grad output
+  x_ptr,  # Input. (NUM_ROWS, D)
+  weight_ptr,  # Input. (D,)
+  grad_output_ptr,  # Grad Input. (NUM_ROWS,)
+  grad_x_ptr,  # Grad output. (NUM_ROWS, D)
+  partial_grad_weight_ptr,  # Grad output. (n_row_tiles, D)
   stride_xr,
   stride_xd,
   stride_wd,
@@ -151,6 +151,9 @@ def weighted_sum_backward_kernel(
   row_tile_idx = tl.program_id(axis=0)
   n_row_tiles = tl.cdiv(NUM_ROWS, ROWS_TILE_SIZE)
   n_d_tiles = tl.cdiv(D, D_TILE_SIZE)
+  # tl.device_print("===lizhi row_tile_idx = ", row_tile_idx)
+  # tl.device_print("===lizhi n_row_tiles = ", n_row_tiles)
+  # tl.device_print("===lizhi n_d_tiles = ", n_d_tiles)
 
   # TODO(lizhi): I think having each thread to handle one D is more efficient.
   # But here we follow the instruction to have each thread to handle one ROW.
@@ -213,16 +216,21 @@ def weighted_sum_backward_kernel(
     row = tl.load(
       x_block_ptr, boundary_check=(0, 1), padding_option="zero"
     )  # (ROWS_TILE_SIZE, D_TILE_SIZE)
-    grad_weight_row = grad_output[None, :] @ row  # (1, D_TILE_SIZE)
+    grad_weight_row = tl.sum(
+      grad_output[:, None] * row,
+      axis=0,
+    )[None, :]  # (1, D_TILE_SIZE)
     tl.store(
       partial_grad_weight_block_ptr, grad_weight_row, boundary_check=(1,)
     )
 
     # Advance the blocks.
-    x_block_ptr.advance((0, D_TILE_SIZE))
-    weight_block_ptr.advance((D_TILE_SIZE,))
-    grad_x_block_ptr.advance((0, D_TILE_SIZE))
-    partial_grad_weight_block_ptr.advance((0, D_TILE_SIZE))
+    x_block_ptr = x_block_ptr.advance((0, D_TILE_SIZE))
+    weight_block_ptr = weight_block_ptr.advance((D_TILE_SIZE,))
+    grad_x_block_ptr = grad_x_block_ptr.advance((0, D_TILE_SIZE))
+    partial_grad_weight_block_ptr = partial_grad_weight_block_ptr.advance(
+      (0, D_TILE_SIZE)
+    )
 
 
 class WeightedSumFunc(torch.autograd.Function):
@@ -240,7 +248,7 @@ class WeightedSumFunc(torch.autograd.Function):
 
     ctx.save_for_backward(x, weight)
 
-    assert len(weight.shape) == 1 and output_dim == weight.shape[0], (
+    assert len(weight.shape) == 1 and D == weight.shape[0], (
       "Dimension mismatch."
     )
     assert x.is_cuda and weight.is_cuda, "Expected CUDA tensors"
@@ -258,7 +266,7 @@ class WeightedSumFunc(torch.autograd.Function):
     num_blocks = triton.cdiv(num_rows, ctx.ROW_TILE_SIZE)
     y = torch.empty((num_rows,), device=x.device)
 
-    weighted_sum_kernel[(num_blocks,)](
+    weighted_sum_forward_kernel[(num_blocks,)](
       x,
       weight,
       y,
@@ -271,6 +279,7 @@ class WeightedSumFunc(torch.autograd.Function):
       ROWS_TILE_SIZE=ctx.ROW_TILE_SIZE,
       D_TILE_SIZE=ctx.D_TILE_SIZE,
     )
+    return y.view(output_dim)
 
   @staticmethod
   def backward(ctx, grad_out):
@@ -278,8 +287,10 @@ class WeightedSumFunc(torch.autograd.Function):
 
     assert len(x.shape) == 2, "Wrong x dim"
     assert len(weight.shape) == 1, "Wrong weight dim"
-    assert len(grad_out.shape) == 1, "Wrong grad_out dim"
-    assert x.shape[0] == grad_out.shape[0], (
+    assert len(grad_out.shape) == len(ctx.input_shape[:-1]), (
+      "Wrong grad_out dim"
+    )
+    assert ctx.input_shape[:-1] == grad_out.shape, (
       "Mismatched x & grad_out dimensions."
     )
     assert x.shape[1] == weight.shape[0], "Mismatched x & weight dimensions."
@@ -288,6 +299,10 @@ class WeightedSumFunc(torch.autograd.Function):
     assert grad_out.device == weight.device, (
       "Device mismatch between grad_out & weight"
     )
+
+    grad_out = einops.rearrange(grad_out, "... -> (...)")
+    assert x.shape[0] == grad_out.shape[0], "Wrong dim"
+
     num_rows = x.shape[0]
     D = x.shape[1]
 
@@ -323,18 +338,45 @@ class WeightedSumFunc(torch.autograd.Function):
 
 def main() -> None:
   x = torch.rand((8, 16, 32), dtype=torch.float32, device=DEVICE)
-  print(f"{x.stride()=}")
-
   weight = torch.rand(32, dtype=torch.float32, device=DEVICE)
-  result = weighted_sum(x, weight)
-  expected = torch.sum(x * weight, dim=-1)
+  x.requires_grad_()
+  weight.requires_grad_()
+  print(f"{x.shape=}, {weight.shape=}")
+  print(f"{x.stride()=}, {weight.stride()=}")
+
+  x_dup = x.detach().clone()
+  weight_dup = weight.detach().clone()
+  x_dup.requires_grad_()
+  weight_dup.requires_grad_()
+
+  print("======================= The forward fn =========================")
+  result = WeightedSumFunc.apply(x, weight)
+  print(f"{result=}")
+
+  expected = torch.sum(x_dup * weight_dup, dim=-1)
   assert result.shape == expected.shape, (
     f"shape mismatch: {result.shape} != {expected.shape}"
   )
   assert torch.allclose(result, expected), (
     "weighted_sum result does not match expected"
   )
-  print("weighted_sum passed", result)
+  print(f"weighted_sum forward passed!!! {result.shape=}")
+
+  print("======================= The backward fn =========================")
+  loss = result.sum()
+  loss.backward()
+  print(f"Backward result {x.grad.shape=}, {weight.grad.shape=}")
+
+  expected_loss = expected.sum()
+  assert torch.allclose(loss, expected_loss), f"{loss=}, {expected_loss=}"
+  expected_loss.backward()
+  assert torch.allclose(x.grad, x_dup.grad), f"{x.grad=}, {x_dup.grad=}"
+  assert torch.allclose(weight.grad, weight_dup.grad), (
+    f"{weight.grad=}, {weight_dup.grad=}"
+  )
+  print(
+    f"weighted_sum backward passed!!! {x.grad.shape=}, {weight.grad.shape=}"
+  )
 
 
 if __name__ == "__main__":
