@@ -1,7 +1,7 @@
 # Triton kernels.
 #
 # Run the code:
-# uv run cs336_systems/triton_kernels.py
+# uv run cs336_systems/triton_kernels_weight_sum.py
 
 import einops
 import jaxtyping
