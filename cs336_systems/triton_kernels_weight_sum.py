@@ -151,9 +151,6 @@ def weighted_sum_backward_kernel(
   row_tile_idx = tl.program_id(axis=0)
   n_row_tiles = tl.cdiv(NUM_ROWS, ROWS_TILE_SIZE)
   n_d_tiles = tl.cdiv(D, D_TILE_SIZE)
-  # tl.device_print("===lizhi row_tile_idx = ", row_tile_idx)
-  # tl.device_print("===lizhi n_row_tiles = ", n_row_tiles)
-  # tl.device_print("===lizhi n_d_tiles = ", n_d_tiles)
 
   # TODO(lizhi): I think having each thread to handle one D is more efficient.
   # But here we follow the instruction to have each thread to handle one ROW.
