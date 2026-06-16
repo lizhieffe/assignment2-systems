@@ -35,10 +35,7 @@ class TorchFlashAttention2Func(torch.autograd.Function):
     K: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
     V: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
     is_causal: bool,
-  ) -> tuple[
-    jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
-    jaxtyping.Float[torch.Tensor, "*LEADING_DIM"],
-  ]:
+  ) -> jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"]:
     """
     Args:
 
@@ -52,12 +49,18 @@ class TorchFlashAttention2Func(torch.autograd.Function):
 
     input_shape = Q.shape
 
-    # Convert to 2D for ease of processing.
-    Q = einops.rearrange(Q, "... D -> (...) D")
-    K = einops.rearrange(K, "... D -> (...) D")
-    V = einops.rearrange(V, "... D -> (...) D")
+    # Add batch dim if it is not there.
+    if len(Q.shape) == 2:
+      Q = einops.rearrange(Q, "... -> () ...")
+      K = einops.rearrange(K, "... -> () ...")
+      V = einops.rearrange(V, "... -> () ...")
 
-    num_rows, D = Q.shape[0], Q.shape[-1]
+    # Convert to 2D for ease of processing.
+    Q = einops.rearrange(Q, "... N D -> (...) N D")
+    K = einops.rearrange(K, "... N D -> (...) N D")
+    V = einops.rearrange(V, "... N D -> (...) N D")
+
+    B, num_rows, D = Q.shape
 
     # Inheritate from weight sum kernel.
     ctx.Q_TILE_SIZE = (
@@ -70,68 +73,73 @@ class TorchFlashAttention2Func(torch.autograd.Function):
     NUM_Q_TILES = triton.cdiv(num_rows, ctx.Q_TILE_SIZE)
     NUM_K_TILES = triton.cdiv(num_rows, ctx.K_TILE_SIZE)
 
-    q_tiles = torch.split(Q, split_size_or_sections=ctx.Q_TILE_SIZE)
-    k_tiles = torch.split(K, split_size_or_sections=ctx.K_TILE_SIZE)
-    v_tiles = torch.split(V, split_size_or_sections=ctx.K_TILE_SIZE)
-
     o_tiles = []  # softmax results
     l_tiles = []  # denominator of softmax
 
-    NUM_Q_TILES = len(q_tiles)
-    NUM_K_TILES = len(k_tiles)
-    NUM_V_TILES = NUM_K_TILES
+    for bi in range(B):  # The outer loop is for (batch * head) dim.
+      q_tiles = torch.split(Q[bi], split_size_or_sections=ctx.Q_TILE_SIZE)
+      k_tiles = torch.split(K[bi], split_size_or_sections=ctx.K_TILE_SIZE)
+      v_tiles = torch.split(V[bi], split_size_or_sections=ctx.K_TILE_SIZE)
 
-    for i in range(NUM_Q_TILES):
-      q_tile = q_tiles[i]  # (ctx.Q_TILE_SIZE, D)
-      o_tile = torch.zeros_like(q_tile)  # (ctx.Q_TILE_SIZE, D)
+      for i in range(NUM_Q_TILES):
+        q_tile = q_tiles[i]  # (ctx.Q_TILE_SIZE, D)
+        o_tile = torch.zeros_like(q_tile)  # (ctx.Q_TILE_SIZE, D)
 
-      # l_tile is the running proxy of the softmax denominator.
-      l_tile = torch.zeros(
-        (ctx.Q_TILE_SIZE,), device=Q.device, dtype=Q.dtype
-      )  # (ctx.Q_TILE_SIZE,)
-
-      # m_tile is the running maxium.
-      m_tile = torch.full(
-        (ctx.Q_TILE_SIZE,), float("-inf"), device=Q.device, dtype=Q.dtype
-      )  # (ctx.Q_TILE_SIZE,)
-
-      for j in range(NUM_K_TILES):
-        k_tile = k_tiles[j]  # (ctx.K_TILE_SIZE, D)
-        v_tile = v_tiles[j]  # (ctx.K_TILE_SIZE, D)
-
-        s = (
-          q_tile @ k_tile.transpose(0, 1) / D**0.5
-        )  # (ctx.Q_TILE_SIZE, ctx.K_TILE_SIZE)
-        m_tile_next = torch.maximum(
-          m_tile, torch.max(s, dim=-1).values
-        )  # (ctx.Q_TILE_SIZE,)
-        p = torch.exp(
-          s - m_tile_next[:, None]
-        )  # (ctx.Q_TILE_SIZE, ctx.K_TILE_SIZE)
-        l_tile_next = torch.exp(m_tile - m_tile_next) * l_tile + torch.sum(
-          p, dim=-1
+        # l_tile is the running proxy of the softmax denominator.
+        l_tile = torch.zeros(
+          (ctx.Q_TILE_SIZE,), device=Q.device, dtype=Q.dtype
         )  # (ctx.Q_TILE_SIZE,)
 
-        # diag() is to scale the each row of o_tile by the corresponding element of
-        # torch.exp(m_tile - m_tile_next)
-        diag = torch.diag(
-          torch.exp(m_tile - m_tile_next)
-        )  # (ctx.Q_TILE_SIZE,ctx.Q_TILE_SIZE)
-        o_tile_next = diag @ o_tile + p @ v_tile  # (ctx.Q_TILE_SIZE, D)
+        # m_tile is the running maxium.
+        m_tile = torch.full(
+          (ctx.Q_TILE_SIZE,), float("-inf"), device=Q.device, dtype=Q.dtype
+        )  # (ctx.Q_TILE_SIZE,)
 
-        # Update m, l & o
-        m_tile = m_tile_next
-        l_tile = l_tile_next
-        o_tile = o_tile_next
+        for j in range(NUM_K_TILES):
+          k_tile = k_tiles[j]  # (ctx.K_TILE_SIZE, D)
+          v_tile = v_tiles[j]  # (ctx.K_TILE_SIZE, D)
 
-      o_tiles.append(
-        torch.inverse(torch.diag(l_tile)) @ o_tile
-      )  # (ctx.Q_TILE_SIZE, D)
-      l_tiles.append(m_tile + torch.log(l_tile))  # (ctx.Q_TILE_SIZE,)
+          s = (
+            q_tile @ k_tile.transpose(0, 1) / D**0.5
+          )  # (ctx.Q_TILE_SIZE, ctx.K_TILE_SIZE)
+          m_tile_next = torch.maximum(
+            m_tile, torch.max(s, dim=-1).values
+          )  # (ctx.Q_TILE_SIZE,)
+          p = torch.exp(
+            s - m_tile_next[:, None]
+          )  # (ctx.Q_TILE_SIZE, ctx.K_TILE_SIZE)
+          l_tile_next = torch.exp(m_tile - m_tile_next) * l_tile + torch.sum(
+            p, dim=-1
+          )  # (ctx.Q_TILE_SIZE,)
 
-    return torch.stack(o_tiles, dim=0).view(input_shape), torch.stack(
+          # diag() is to scale the each row of o_tile by the corresponding element of
+          # torch.exp(m_tile - m_tile_next)
+          diag = torch.diag(
+            torch.exp(m_tile - m_tile_next)
+          )  # (ctx.Q_TILE_SIZE,ctx. Q_TILE_SIZE)
+          o_tile_next = diag @ o_tile + p @ v_tile  # (ctx.Q_TILE_SIZE, D)
+
+          # Update m, l & o
+          m_tile = m_tile_next
+          l_tile = l_tile_next
+          o_tile = o_tile_next
+
+        o_tiles.append(
+          torch.inverse(torch.diag(l_tile)) @ o_tile
+        )  # (ctx.Q_TILE_SIZE, D)
+        l_tiles.append(m_tile + torch.log(l_tile))  # (ctx.Q_TILE_SIZE,)
+
+    output = torch.stack(o_tiles, dim=0)  # (NUM_Q_TILES, ctx.Q_TILE_SIZE, D)
+    output = output.view(input_shape)
+
+    softmax_denominator = torch.stack(
       l_tiles, dim=0
-    ).view(input_shape[:-1])
+    )  # (NUM_Q_TILES, ctx.Q_TILE_SIZE)
+    softmax_denominator = softmax_denominator.view(input_shape[:-1])
+
+    ctx.save_for_backward(softmax_denominator, Q, K, V, output)
+
+    return output
 
   @staticmethod
   def backward(ctx, grad_out):
@@ -139,16 +147,13 @@ class TorchFlashAttention2Func(torch.autograd.Function):
 
 
 def main() -> None:
-  input_shape = (32, 64)
+  input_shape = (4, 32, 64)
   Q = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
   K = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
   V = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
 
-  forward_res, softmax_denominator = TorchFlashAttention2Func.apply(
-    Q, K, V, False
-  )
+  forward_res = TorchFlashAttention2Func.apply(Q, K, V, False)
   assert forward_res.shape == input_shape
-  assert softmax_denominator.shape == input_shape[:-1]
 
   expected_forward_res = torch_plain_attention(Q, K, V)
   assert torch.allclose(forward_res, expected_forward_res), (
