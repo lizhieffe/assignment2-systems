@@ -173,12 +173,10 @@ def flash_fwd_kernel(
   D: tl.constexpr,
   Q_TILE_SIZE: tl.constexpr,
   K_TILE_SIZE: tl.constexpr,
+  is_causal: tl.constexpr,
 ):
   query_tile_idx = tl.program_id(axis=0)
   batch_idx = tl.program_id(axis=1)
-
-  # Absolute query positions handled by this program (fixed across the K loop).
-  q_offsets = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
 
   Q_block_ptr = tl.make_block_ptr(
     base=Q_ptr + batch_idx * stride_qb,
@@ -249,6 +247,15 @@ def flash_fwd_kernel(
     )  # (K_TILE_SIZE, D)
 
     S_i = tl.dot(Q_i, K_j) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+
+    if is_causal:
+      q_indexes = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+      k_indexes = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+      mask = q_indexes[:, None] >= k_indexes[None, :]
+      mask = mask.to(
+        tl.int1
+      )  # Convert to bool; 0 means the positions that is after the queiry position and thus no attention.
+      S_i = tl.where(mask, S_i, -1e6)
 
     m_i_next = tl.maximum(m_i, tl.max(S_i, axis=1))  # (Q_TILE_SIZE,)
     P_i = tl.exp(S_i - m_i_next[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
@@ -339,9 +346,11 @@ class TritonFlashAttention2Func(torch.autograd.Function):
       D,
       Q_TILE_SIZE,
       K_TILE_SIZE,
+      is_causal,
     )
 
     ctx.save_for_backward(softmax_denominator, Q, K, V, output)
+    ctx.is_causal = is_causal
 
     return output
 
