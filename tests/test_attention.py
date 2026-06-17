@@ -42,6 +42,7 @@ def _make_attn_inputs(device=None):
 
 def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     q, k, v, _do = _make_attn_inputs(device)
+    print(f"\n\n===lizhi {q.shape=} {k.shape=} {v.shape=}")
     o = impl(q, k, v, is_causal)
 
     # Extract L from the saved tensors

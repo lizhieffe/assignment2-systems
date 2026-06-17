@@ -177,6 +177,9 @@ def flash_fwd_kernel(
   query_tile_idx = tl.program_id(axis=0)
   batch_idx = tl.program_id(axis=1)
 
+  # Absolute query positions handled by this program (fixed across the K loop).
+  q_offsets = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
   Q_block_ptr = tl.make_block_ptr(
     base=Q_ptr + batch_idx * stride_qb,
     shape=(N_QUERIES, D),
@@ -185,12 +188,13 @@ def flash_fwd_kernel(
     block_shape=(Q_TILE_SIZE, D),
     order=(0, 1),
   )
+  # Load K transposed as (D, N_KEYS) so we can do Q @ K^T without using .T
   K_block_ptr = tl.make_block_ptr(
     base=K_ptr + batch_idx * stride_kb,
-    shape=(N_KEYS, D),
-    strides=(stride_kk, stride_kd),
+    shape=(D, N_KEYS),
+    strides=(stride_kd, stride_kk),
     offsets=(0, 0),
-    block_shape=(K_TILE_SIZE, D),
+    block_shape=(D, K_TILE_SIZE),
     order=(0, 1),
   )
   V_block_ptr = tl.make_block_ptr(
@@ -234,27 +238,27 @@ def flash_fwd_kernel(
   for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
     K_j = tl.load(
       K_block_ptr,
-      boundary_check=(
-        0,
-      ),  # boundary check the dim 0 only becuase it never goes out of boundary on dim 1
+      boundary_check=(1,),  # boundary check dim 1 (N_KEYS direction)
       padding_option="zero",
-    )  # (K_TILE_SIZE, D)
+    )  # (D, K_TILE_SIZE)
+
     V_j = tl.load(
       V_block_ptr,
-      boundary_check=(
-        0,
-      ),  # boundary check the dim 0 only becuase it never goes out of boundary on dim 1
+      boundary_check=(0,),
       padding_option="zero",
     )  # (K_TILE_SIZE, D)
 
-    S_i = tl.dot(Q_i, K_j.T) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
-    m_i_next = tl.maximum(m_i, tl.max(S_i, axis=-1))  # (Q_TILE_SIZE,)
+    S_i = tl.dot(Q_i, K_j) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+
+    m_i_next = tl.maximum(m_i, tl.max(S_i, axis=1))  # (Q_TILE_SIZE,)
     P_i = tl.exp(S_i - m_i_next[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+
     l_i_next = tl.exp(m_i - m_i_next) * l_i + tl.sum(
-      P_i, axis=-1
+      P_i, axis=1
     )  # (Q_TILE_SIZE,)
-    O_i_next = tl.dot(
-      P_i.to(V_j.dtype), V_j, acc=tl.exp(m_i - m_i_next)[:, None] * O_i
+    O_i_next = tl.exp(m_i - m_i_next)[:, None] * O_i + tl.dot(
+      P_i.to(tl.float32),
+      V_j.to(tl.float32),
     )  # (Q_TILE_SIZE, D)
 
     # Update the running values.
@@ -262,9 +266,12 @@ def flash_fwd_kernel(
     l_i = l_i_next
     O_i = O_i_next
 
-    # Advance block pointers.
-    K_block_ptr.advance((K_TILE_SIZE, 0))
-    V_block_ptr.advance((K_TILE_SIZE, 0))
+    # Advance block pointers. advance() returns a NEW pointer; it does not
+    # mutate in place, so the result must be reassigned.
+    K_block_ptr = K_block_ptr.advance(
+      (0, K_TILE_SIZE)
+    )  # advance in the N_KEYS direction (dim 1 of K^T)
+    V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
   O_i = O_i / l_i[:, None]  # (Q_TILE_SIZE, D)
   l_i = m_i + tl.log(l_i)  # (Q_TILE_SIZE,)
@@ -277,20 +284,92 @@ def flash_fwd_kernel(
   )
 
 
+class TritonFlashAttention2Func(torch.autograd.Function):
+  @staticmethod
+  def forward(
+    ctx,
+    Q: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
+    K: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
+    V: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
+    is_causal: bool,
+  ) -> jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"]:
+    assert len(Q.shape) == 3
+    assert len(Q.shape) == len(K.shape)
+    assert len(Q.shape) == len(V.shape)
+    assert K.shape == V.shape
+
+    assert Q.is_cuda and K.is_cuda and V.is_cuda
+    assert Q.is_contiguous() and K.is_contiguous() and V.is_contiguous()
+
+    N_BATCHES, N_QUERIES, D = Q.shape
+    N_KEYS = K.shape[-2]
+    Q_TILE_SIZE = 16
+    K_TILE_SIZE = 16
+
+    num_query_tiles = math.ceil(N_QUERIES / Q_TILE_SIZE)
+
+    output = torch.empty_like(Q)
+    softmax_denominator = torch.empty(
+      (N_BATCHES, N_QUERIES), device=Q.device, dtype=Q.dtype
+    )
+
+    flash_fwd_kernel[(num_query_tiles, N_BATCHES)](
+      Q,
+      K,
+      V,
+      output,
+      softmax_denominator,
+      Q.stride()[0],
+      Q.stride()[1],
+      Q.stride()[2],
+      K.stride()[0],
+      K.stride()[1],
+      K.stride()[2],
+      V.stride()[0],
+      V.stride()[1],
+      V.stride()[2],
+      output.stride()[0],
+      output.stride()[1],
+      output.stride()[2],
+      softmax_denominator.stride()[0],
+      softmax_denominator.stride()[1],
+      N_QUERIES,
+      N_KEYS,
+      1 / math.sqrt(D),
+      D,
+      Q_TILE_SIZE,
+      K_TILE_SIZE,
+    )
+
+    ctx.save_for_backward(softmax_denominator, Q, K, V, output)
+
+    return output
+
+
 def main() -> None:
-  input_shape = (4, 32, 64)
+  input_shape = (32, 128, 256)
   Q = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
   K = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
   V = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
 
-  forward_res = TorchFlashAttention2Func.apply(Q, K, V, False)
-  assert forward_res.shape == input_shape
-
   expected_forward_res = torch_plain_attention(Q, K, V)
-  assert torch.allclose(forward_res, expected_forward_res), (
-    f"{forward_res=}, {expected_forward_res=}"
+
+  # Assert torch Flash Attention
+  torch_forward_res = TorchFlashAttention2Func.apply(Q, K, V, False)
+  assert torch_forward_res.shape == input_shape
+  assert torch.allclose(torch_forward_res, expected_forward_res), (
+    f"{torch_forward_res=}, {expected_forward_res=}"
   )
   print("TorchFlashAttention2Func -> Passed!!!")
+
+  # Assert torch Flash Attention
+  triton_forward_res = TritonFlashAttention2Func.apply(Q, K, V, False)
+  assert triton_forward_res.shape == input_shape
+  # The tolerance is the same as _test_flash_forward_pass.
+  assert torch.allclose(
+    triton_forward_res, expected_forward_res, rtol=1e-2, atol=1e-2
+  ), f"{triton_forward_res=}, {expected_forward_res=}"
+  print("TritonFlashAttention2Func -> Passed!!!")
 
 
 if __name__ == "__main__":
