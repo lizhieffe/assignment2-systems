@@ -27,6 +27,37 @@ def torch_plain_attention(
   return output
 
 
+@torch.compile
+def torch_flash_backward(
+  Q: jaxtyping.Float[torch.Tensor, "B Q D"],
+  K: jaxtyping.Float[torch.Tensor, "B K D"],
+  V: jaxtyping.Float[torch.Tensor, "B K D"],
+  output: jaxtyping.Float[torch.Tensor, "B Q D"],
+  d_output: jaxtyping.Float[torch.Tensor, "B Q D"],
+  softmax_denominator: jaxtyping.Float[torch.Tensor, "B Q"],
+) -> tuple[
+  jaxtyping.Float[torch.Tensor, "B Q D"],  # dQ
+  jaxtyping.Float[torch.Tensor, "B K D"],  # dK
+  jaxtyping.Float[torch.Tensor, "B V D"],  # dV
+]:
+  """Backward with recomputation.
+
+  Followed Eq 13 - 19."""
+  assert len(Q.shape) == 3
+  _, _, d = Q.shape
+
+  d_sqrt = d**0.5
+  S = Q @ torch.transpose(K, -1, -2) / d_sqrt  # (B, Q, K)
+  P = torch.exp(S - softmax_denominator.unsqueeze(-1))  # (B, Q, K)
+  dV = P.transpose(-1, -2) @ d_output  # (B, K, D)
+  dP = d_output @ V.transpose(-1, -2)  # (B, Q, K)
+  D = torch.sum(output * d_output, dim=-1)  # (B, Q)
+  dS = P * (dP - D.unsqueeze(-1))  # (B, Q, K)
+  dQ = dS @ K / d_sqrt  # (B, Q, D)
+  dK = dS.transpose(-1, -2) @ Q / d_sqrt  # (B, K, D)
+  return dQ, dK, dV, None
+
+
 class TorchFlashAttention2Func(torch.autograd.Function):
   @staticmethod
   def forward(
@@ -143,7 +174,15 @@ class TorchFlashAttention2Func(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_out):
-    raise NotImplementedError("backward pass not yet implemented")
+    softmax_denominator, Q, K, V, output = ctx.saved_tensors
+    return torch_flash_backward(
+      Q=Q,
+      K=K,
+      V=V,
+      output=output,
+      d_output=grad_out,
+      softmax_denominator=softmax_denominator,
+    )
 
 
 @triton.jit
