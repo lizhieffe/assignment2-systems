@@ -40,9 +40,9 @@ def torch_flash_backward(
   jaxtyping.Float[torch.Tensor, "B K D"],  # dK
   jaxtyping.Float[torch.Tensor, "B V D"],  # dV
 ]:
-  """Backward with recomputation.
+  """Plain backward without recomputation.
 
-  Followed Eq 13 - 19."""
+  Followed Eq 4 - 6 & 12."""
   assert len(Q.shape) == 3
   _, _, d = Q.shape
 
@@ -330,6 +330,48 @@ def flash_fwd_kernel(
   )
 
 
+@torch.compile
+def torch_flash_backward_recomputation(
+  Q: jaxtyping.Float[torch.Tensor, "B Q D"],
+  K: jaxtyping.Float[torch.Tensor, "B K D"],
+  V: jaxtyping.Float[torch.Tensor, "B K D"],
+  output: jaxtyping.Float[torch.Tensor, "B Q D"],
+  d_output: jaxtyping.Float[torch.Tensor, "B Q D"],
+  softmax_denominator: jaxtyping.Float[torch.Tensor, "B Q"],
+  is_causal: bool = False,
+) -> tuple[
+  jaxtyping.Float[torch.Tensor, "B Q D"],  # dQ
+  jaxtyping.Float[torch.Tensor, "B K D"],  # dK
+  jaxtyping.Float[torch.Tensor, "B V D"],  # dV
+]:
+  """Backward with recomputation.
+
+  Followed Eq 13 - 19."""
+  assert len(Q.shape) == 3
+  _, N_QUERIES, d = Q.shape
+
+  assert N_QUERIES == K.shape[1]
+
+  d_sqrt = d**0.5
+
+  S = Q @ torch.transpose(K, -1, -2) / d_sqrt  # (B, Q, K)
+  if is_causal:
+    causal_mask = (
+      torch.arange(N_QUERIES, device=S.device)[:, None]
+      >= torch.arange(N_QUERIES, device=S.device)[None, :]
+    )
+    S = S.masked_fill(~causal_mask, float("-inf"))
+
+  P = torch.exp(S - softmax_denominator.unsqueeze(-1))  # (B, Q, K)
+  dV = P.transpose(-1, -2) @ d_output  # (B, K, D)
+  dP = d_output @ V.transpose(-1, -2)  # (B, Q, K)
+  D = torch.sum(output * d_output, dim=-1)  # (B, Q)
+  dS = P * (dP - D.unsqueeze(-1))  # (B, Q, K)
+  dQ = dS @ K / d_sqrt  # (B, Q, D)
+  dK = dS.transpose(-1, -2) @ Q / d_sqrt  # (B, K, D)
+  return dQ, dK, dV, None
+
+
 class TritonFlashAttention2Func(torch.autograd.Function):
   @staticmethod
   def forward(
@@ -392,6 +434,19 @@ class TritonFlashAttention2Func(torch.autograd.Function):
     ctx.is_causal = is_causal
 
     return output
+
+  @staticmethod
+  def backward(ctx, grad_out):
+    softmax_denominator, Q, K, V, output = ctx.saved_tensors
+    return torch_flash_backward_recomputation(
+      Q=Q,
+      K=K,
+      V=V,
+      output=output,
+      d_output=grad_out,
+      softmax_denominator=softmax_denominator,
+      is_causal=ctx.is_causal,
+    )
 
 
 def main() -> None:
