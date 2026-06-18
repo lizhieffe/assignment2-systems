@@ -4,6 +4,7 @@
 # uv run cs336_systems/triton_kernels_flash_attention_2.py
 
 import einops
+import functools
 import jaxtyping
 import math
 import triton
@@ -19,9 +20,17 @@ def torch_plain_attention(
   Q: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
   K: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
   V: jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"],
+  is_causal: bool = False,
 ) -> jaxtyping.Float[torch.Tensor, "*LEADING_DIM D"]:
   D = Q.shape[-1]
+  N = Q.shape[-2]
   S = Q @ K.transpose(-1, -2) / D**0.5  # (B, N, N)
+  if is_causal:
+    causal_mask = (
+      torch.arange(N, device=S.device)[:, None]
+      >= torch.arange(N, device=S.device)[None, :]
+    )
+    S = S.masked_fill(~causal_mask, float("-inf"))
   P = torch.softmax(S, dim=-1)  # (B, N, N)
   output = P @ V  # (B, N, D)
   return output
@@ -391,8 +400,8 @@ class TritonFlashAttention2Func(torch.autograd.Function):
 
     N_BATCHES, N_QUERIES, D = Q.shape
     N_KEYS = K.shape[-2]
-    Q_TILE_SIZE = 16
-    K_TILE_SIZE = 16
+    Q_TILE_SIZE = 32
+    K_TILE_SIZE = 32
 
     num_query_tiles = math.ceil(N_QUERIES / Q_TILE_SIZE)
 
@@ -449,7 +458,104 @@ class TritonFlashAttention2Func(torch.autograd.Function):
     )
 
 
+def create_benchmark_inputs(seq_len, emb_dim, dtype):
+  Q = torch.rand(
+    (1, seq_len, emb_dim),
+    device=DEVICE,
+    dtype=dtype,
+    requires_grad=True,
+  )
+  K = torch.rand(
+    (1, seq_len, emb_dim),
+    device=DEVICE,
+    dtype=dtype,
+    requires_grad=True,
+  )
+  V = torch.rand(
+    (1, seq_len, emb_dim),
+    device=DEVICE,
+    dtype=dtype,
+    requires_grad=True,
+  )
+  grad_out = torch.rand((1, seq_len, emb_dim), device=DEVICE, dtype=dtype)
+  return Q, K, V, grad_out
+
+
+def benchmark() -> None:
+  WARMUP = 1000
+  REP = 3000
+  DTYPE = torch.bfloat16
+
+  # Triton impl
+  for seq_len in [
+    2**i for i in range(int(math.log2(128)), int(math.log2(65536 * 2)))
+  ]:
+    for emb_dim in [16, 32, 64, 128]:
+      try:
+        Q, K, V, grad_out = create_benchmark_inputs(
+          seq_len=seq_len, emb_dim=emb_dim, dtype=DTYPE
+        )
+        fwd_fn = functools.partial(
+          TritonFlashAttention2Func.apply, Q, K, V, True
+        )
+        fwd_runtime = triton.testing.do_bench(fwd_fn, warmup=WARMUP, rep=REP)
+
+        Q, K, V, grad_out = create_benchmark_inputs(
+          seq_len=seq_len, emb_dim=emb_dim, dtype=DTYPE
+        )
+
+        def fwd_bwd_fn():
+          TritonFlashAttention2Func.apply(Q, K, V, True).backward(grad_out)
+
+        fwd_bwd_runtime = triton.testing.do_bench(
+          fwd_bwd_fn, warmup=WARMUP, rep=REP
+        )
+
+        print(
+          f"Triton {seq_len=} {emb_dim=}: fwd={fwd_runtime:.4f}ms, "
+          f"bwd={fwd_bwd_runtime - fwd_runtime:.4f}ms, "
+          f"fwd-bwd={fwd_bwd_runtime:.4f}ms"
+        )
+      except torch.OutOfMemoryError:
+        print(f"Triton {seq_len=} {emb_dim=}: OOM")
+
+  # Torch impl
+  for seq_len in [
+    2**i for i in range(int(math.log2(128)), int(math.log2(65536 * 2)))
+  ]:
+    for emb_dim in [16, 32, 64, 128]:
+      try:
+        Q, K, V, grad_out = create_benchmark_inputs(
+          seq_len=seq_len, emb_dim=emb_dim, dtype=DTYPE
+        )
+        fwd_fn = functools.partial(torch_plain_attention, Q, K, V, True)
+        fwd_runtime = triton.testing.do_bench(fwd_fn, warmup=WARMUP, rep=REP)
+
+        Q, K, V, grad_out = create_benchmark_inputs(
+          seq_len=seq_len, emb_dim=emb_dim, dtype=DTYPE
+        )
+
+        def fwd_bwd_fn():
+          output = torch_plain_attention(Q, K, V, True)
+          output.backward(grad_out)
+
+        fwd_bwd_runtime = triton.testing.do_bench(
+          fwd_bwd_fn, warmup=WARMUP, rep=REP
+        )
+
+        print(
+          f"Torch {seq_len=} {emb_dim=}: fwd={fwd_runtime:.4f}ms, "
+          f"bwd={fwd_bwd_runtime - fwd_runtime:.4f}ms, "
+          f"fwd-bwd={fwd_bwd_runtime:.4f}ms"
+        )
+      except torch.OutOfMemoryError:
+        print(f"Torch {seq_len=} {emb_dim=}: OOM")
+
+
 def main() -> None:
+  benchmark()
+  return
+
   input_shape = (32, 128, 256)
   Q = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)
   K = torch.rand(input_shape, dtype=torch.float32, device=DEVICE)

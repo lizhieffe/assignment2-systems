@@ -896,3 +896,51 @@ At small T, the launch overhead of softmax kernels relative to their 1 μs runti
   - **Gradient checkpointing:** Save only the input and recompute attention in backward
   - **Sparse attention:** Reduce T² to T·log(T) or T via local/strided patterns
   - **Multi-GPU / distributed attention:** Shard T dimension across GPUs
+
+---
+
+## FlashAttention-2 (Triton) Benchmarking
+
+**Implementation:** `cs336_systems/triton_kernels_flash_attention_2.py` — forward pass is a real fused, tiled `@triton.jit` kernel (`flash_fwd_kernel`) using online softmax; backward (`torch_flash_backward_recomputation`) is a recomputation-based formula (Eq 13–19) written in plain PyTorch ops under `@torch.compile`, not a custom Triton kernel.
+
+### Bugs found and fixed along the way
+
+1. **Backward broadcasting bug.** `softmax_denominator` and `D = sum(output * d_output, dim=-1)` both have shape `(B, Q)`. Indexing with `[:, None]` inserts the new axis at position 1 → shape `(B, 1, Q)`, which silently broadcasts against `S`/`P`/`dP` of shape `(B, Q, K)` along the wrong axis whenever `Q == K` (as in the test fixtures). Fixed to `[:, :, None]` (equivalently `.unsqueeze(-1)`), which correctly broadcasts over the K axis per query row. This was causing 74.6% mismatched gradient elements in `test_flash_backward_pytorch`.
+2. **Causal mask device mismatch under `torch.compile`.** `torch.arange(N_QUERIES)` (no `device=`) defaulted to CPU while `S` was on CUDA; `torch.where(causal_mask, S, neg_inf)` then mixed devices, which Dynamo's fake-tensor device propagation rejects (`torch._dynamo.exc.TorchRuntimeError`). Fixed by passing `device=S.device` to both `torch.arange` calls.
+3. **Triton kernel tile size scaling with sequence length.** `Q_TILE_SIZE`/`K_TILE_SIZE` were computed as `max(16, next_power_of_2(N_QUERIES) // 16)` — i.e. tile size grew *linearly with sequence length* instead of being a fixed constant. Shared-memory usage per thread block scales with `Q_TILE_SIZE * K_TILE_SIZE` (score tile) plus `Q_TILE_SIZE * D` / `K_TILE_SIZE * D` (Q/K/V/O tiles), so growing tile size with `N` caused `OutOfResources: shared memory` failures at `seq_len=1024, emb_dim=128` (181 KB required vs. 99 KB hardware limit). This defeats the purpose of tiling — tile size must stay fixed and small regardless of `seq_len`; only the number of tiles (the loop trip count) should grow with `N`.
+4. **Benchmark script measured the wrong forward.** The original benchmark timed `torch_plain_attention` for *both* the "Triton" and "Torch" rows' `fwd_runtime`, then computed `bwd = fwd_bwd_runtime - fwd_runtime` — silently mixing the Flash forward+backward timing with the plain-attention forward baseline. This made the printed Flash "fwd" numbers identical to the plain-attention numbers and inflated the printed Flash "bwd" by the (uncounted) Flash forward cost. Fixed by timing each implementation's own forward function before subtracting.
+
+### Forward latency comparison (FP32, causal, batch=1)
+
+Triton forward (fused, tiled kernel) is consistently faster than plain PyTorch attention forward, with the gap widening at longer sequence lengths:
+
+| seq_len | emb_dim | Triton fwd (ms) | Torch fwd (ms) | Speedup |
+|---|---|---|---|---|
+| 1024 | 128 | 0.0632 | 0.0942 | 1.49× |
+| 4096 | 128 | 0.4608 | 1.2212 | 2.65× |
+| 8192 | 128 | 1.8293 | 4.5980 | 2.51× |
+| 16384 | 128 | 6.4682 | 18.8595 | 2.92× |
+| 32768 | 128 | 24.2597 | 82.7835 | 3.41× |
+
+### Backward latency comparison (FP32, causal, batch=1)
+
+Triton's backward (plain-PyTorch recomputation, no fused kernel) is consistently **slower** than plain PyTorch's autograd backward, and the gap grows with `seq_len`:
+
+| seq_len | emb_dim | Triton bwd (ms) | Torch bwd (ms) | Slowdown |
+|---|---|---|---|---|
+| 1024 | 128 | 0.3413 | 0.4542 | 0.75× (faster) |
+| 4096 | 128 | 3.9304 | 1.8576 | 2.12× slower |
+| 8192 | 128 | 14.9611 | 6.9214 | 2.16× slower |
+| 16384 | 128 | 60.8476 | 27.9974 | 2.17× slower |
+| 32768 | 128 | 247.6393 | 113.7299 | 2.18× slower |
+
+Same pattern holds under BF16 (e.g. `seq_len=32768, emb_dim=128`: Triton bwd 117.99 ms vs. Torch bwd 51.20 ms, ~2.3× slower), and TF32 was confirmed to already be the default `tl.dot` precision for `float32` inputs on tensor-core GPUs — no separate dtype change needed to enable it.
+
+### Why the Flash backward is slower despite a faster forward
+
+The asymmetry is a direct consequence of which half of the implementation is actually a fused Triton kernel:
+
+- **Forward** (`flash_fwd_kernel`) tiles Q/K/V into shared memory and computes the online-softmax running max/sum/output entirely on-chip, so the full `(N, N)` score/probability matrix is never materialized in HBM. This is the textbook FlashAttention memory and bandwidth win, and it shows up directly as the 1.5–3.4× forward speedup above.
+- **Backward** (`torch_flash_backward_recomputation`) is *not* tiled or fused — it recomputes `S = Q @ Kᵀ` from scratch (an extra full matmul that plain PyTorch's autograd avoids, since it already has `S`/`P` saved from its own forward), then materializes the full `(N, N)` tensors `S`, `P`, `dP`, `dS` in global memory exactly like the plain implementation does. So it pays the *recomputation* cost (the whole point of saving memory in the forward pass) without getting the *fusion* benefit (the whole point of FlashAttention's speed) — it inherits the same O(N²) HBM traffic as plain attention's backward, plus one extra O(N²D) matmul on top, which is exactly why the slowdown is largest at the longest sequence lengths.
+
+Real production FlashAttention-2 backward kernels write this same recomputation as a fused, tiled `@triton.jit`/CUDA kernel (recomputing `S` tile-by-tile in shared memory/registers, never spilling the full `(N,N)` matrix to global memory), which is what lets their backward be competitive with — and often faster than — plain attention's backward at scale. Closing this gap here would require writing an actual `flash_bwd_kernel` in Triton rather than the current plain-PyTorch recomputation function.
