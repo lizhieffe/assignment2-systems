@@ -339,6 +339,264 @@ def flash_fwd_kernel(
   )
 
 
+@triton.jit
+def flash_bwd_kernel(
+  Q_ptr,  # (B, Q, D)
+  K_ptr,  # (B, K, D)
+  V_ptr,  # (B, K, D)
+  O_ptr,  # (B, Q, D)
+  dO_ptr,  # (B, Q, D)
+  L_ptr,  # (B, Q)
+  dQ_ptr,  # (B, Q, D)
+  dK_ptr,  # (B, K, D)
+  dV_ptr,  # (B, K, D)
+  stride_qb,
+  stride_qq,
+  stride_qd,
+  stride_kb,
+  stride_kk,
+  stride_kd,
+  stride_vb,
+  stride_vk,
+  stride_vd,
+  stride_ob,
+  stride_oq,
+  stride_od,
+  stride_dob,
+  stride_doq,
+  stride_dod,
+  stride_lb,
+  stride_lq,
+  stride_dqb,
+  stride_dqq,
+  stride_dqd,
+  stride_dkb,
+  stride_dkk,
+  stride_dkd,
+  stride_dvb,
+  stride_dvk,
+  stride_dvd,
+  N_QUERIES,
+  N_KEYS,
+  scale,  # 1 / sqrt(D)
+  D: tl.constexpr,
+  Q_TILE_SIZE: tl.constexpr,
+  K_TILE_SIZE: tl.constexpr,
+  is_causal: tl.constexpr,
+):
+  query_tile_idx = tl.program_id(axis=0)
+  key_tile_idx = tl.program_id(axis=1)
+  batch_idx = tl.program_id(axis=2)
+
+  num_Q_tiles = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
+  num_K_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+  # First loop - calculate dK & dV
+
+  K_block_ptr = tl.make_block_ptr(
+    base=K_ptr + batch_idx * stride_kb,
+    shape=(N_KEYS, D),
+    strides=(stride_kk, stride_kd),
+    offsets=(key_tile_idx * K_TILE_SIZE, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  V_block_ptr = tl.make_block_ptr(
+    base=V_ptr + batch_idx * stride_vb,
+    shape=(N_KEYS, D),
+    strides=(stride_vk, stride_vd),
+    offsets=(key_tile_idx * K_TILE_SIZE, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  dK_block_ptr = tl.make_block_ptr(
+    base=dK_ptr + batch_idx * stride_dkb,
+    shape=(N_KEYS, D),
+    strides=(stride_dkk, stride_dkd),
+    offsets=(key_tile_idx * K_TILE_SIZE, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  dV_block_ptr = tl.make_block_ptr(
+    base=dV_ptr + batch_idx * stride_dvb,
+    shape=(N_KEYS, D),
+    strides=(stride_dvk, stride_dvd),
+    offsets=(key_tile_idx * K_TILE_SIZE, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+
+  K_j = tl.load(
+    K_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (K_TILE_SIZE, D)
+  V_j = tl.load(
+    V_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (K_TILE_SIZE, D)
+  dK_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)  # (K_TILE_SIZE, D)
+  dV_j = tl.zeros((K_TILE_SIZE, D), dtype=tl.float32)  # (K_TILE_SIZE, D)
+
+  Q_block_ptr = tl.make_block_ptr(
+    base=Q_ptr + batch_idx * stride_qb,
+    shape=(N_QUERIES, D),
+    strides=(stride_qq, stride_qd),
+    offsets=(0, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  O_block_ptr = tl.make_block_ptr(
+    base=O_ptr + batch_idx * stride_ob,
+    shape=(N_QUERIES, D),
+    strides=(stride_oq, stride_od),
+    offsets=(0, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  dO_block_ptr = tl.make_block_ptr(
+    base=dO_ptr + batch_idx * stride_dob,
+    shape=(N_QUERIES, D),
+    strides=(stride_doq, stride_dod),
+    offsets=(0, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  L_block_ptr = tl.make_block_ptr(
+    base=L_ptr + batch_idx * stride_lb,
+    shape=(N_QUERIES,),
+    strides=(stride_lq,),
+    offsets=(0,),
+    block_shape=(Q_TILE_SIZE,),
+    order=(0,),
+  )
+
+  for i in range(num_Q_tiles):
+    Q_i = tl.load(
+      Q_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (Q_TILE_SIZE, D)
+    O_i = tl.load(
+      O_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (Q_TILE_SIZE, D)
+    dO_i = tl.load(
+      dO_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (Q_TILE_SIZE, D)
+    D_i = tl.sum(O_i * dO_i, axis=-1)  # (Q_TILE_SIZE,)
+
+    L_i = tl.load(
+      L_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (Q_TILE_SIZE,)
+
+    S_i = tl.dot(Q_i, K_j.T) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+
+    P_i = tl.exp(S_i - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dV_j_next = dV_j + tl.dot(P_i.T, dO_i)  # (K_TILE_SIZE, D)
+    dP_i = tl.dot(dO_i, V_j.T)  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dS_i = P_i * (dP_i - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dK_j_next = dK_j + tl.dot(dS_i.T, Q_i) * scale  # (K_TILE_SIZE, D)
+
+    dV_j = dV_j_next
+    dK_j = dK_j_next
+
+    Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+    O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE, 0))
+    dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+    L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+
+  tl.store(dK_block_ptr, dK_j, boundary_check=(0,))
+  tl.store(dV_block_ptr, dV_j, boundary_check=(0,))
+
+  # Second loop - calculate dQ
+  Q_block_ptr = tl.make_block_ptr(
+    base=Q_ptr + batch_idx * stride_qb,
+    shape=(N_QUERIES, D),
+    strides=(stride_qq, stride_qd),
+    offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  O_block_ptr = tl.make_block_ptr(
+    base=O_ptr + batch_idx * stride_ob,
+    shape=(N_QUERIES, D),
+    strides=(stride_oq, stride_od),
+    offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  dO_block_ptr = tl.make_block_ptr(
+    base=dO_ptr + batch_idx * stride_dob,
+    shape=(N_QUERIES, D),
+    strides=(stride_doq, stride_dod),
+    offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  L_block_ptr = tl.make_block_ptr(
+    base=L_ptr + batch_idx * stride_lb,
+    shape=(N_QUERIES,),
+    strides=(stride_lq,),
+    offsets=(query_tile_idx * Q_TILE_SIZE,),
+    block_shape=(Q_TILE_SIZE,),
+    order=(0,),
+  )
+
+  Q_i = tl.load(
+    Q_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (Q_TILE_SIZE, D)
+  O_i = tl.load(
+    O_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (Q_TILE_SIZE, D)
+  dO_i = tl.load(
+    dO_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (Q_TILE_SIZE, D)
+  D_i = tl.sum(O_i * dO_i, axis=-1)  # (Q_TILE_SIZE,)
+  L_i = tl.load(
+    L_block_ptr, boundary_check=(0,), padding_option="zero"
+  )  # (Q_TILE_SIZE,)
+  dQ_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)  # (Q_TILE_SIZE, D)
+
+  K_block_ptr = tl.make_block_ptr(
+    base=K_ptr + batch_idx * stride_kb,
+    shape=(N_KEYS, D),
+    strides=(stride_kk, stride_kd),
+    offsets=(0, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  V_block_ptr = tl.make_block_ptr(
+    base=V_ptr + batch_idx * stride_vb,
+    shape=(N_KEYS, D),
+    strides=(stride_vk, stride_vd),
+    offsets=(0, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  for j in range(num_K_tiles):
+    K_j = tl.load(
+      K_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (K_TILE_SIZE, D)
+    V_j = tl.load(
+      V_block_ptr, boundary_check=(0,), padding_option="zero"
+    )  # (K_TILE_SIZE, D)
+    S_i = tl.dot(Q_i, K_j.T) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+    P_i = tl.exp(S_i - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dP_i = tl.dot(dO_i, V_j.T)  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dS_i = P_i * (dP_i - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
+    dQ_i_next = dQ_i + tl.dot(dS_i, K_j) * scale  # (Q_TILE_SIZE, DS)
+
+    dQ_i = dQ_i_next
+
+    K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+    V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+  dQ_block_ptr = tl.make_block_ptr(
+    base=dQ_ptr + batch_idx * stride_dqb,
+    shape=(N_QUERIES, D),
+    strides=(stride_dqq, stride_dqd),
+    offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(0, 1),
+  )
+  tl.store(dQ_block_ptr, dQ_i, boundary_check=(0,))
+
+
 @torch.compile
 def torch_flash_backward_recomputation(
   Q: jaxtyping.Float[torch.Tensor, "B Q D"],
@@ -446,16 +704,82 @@ class TritonFlashAttention2Func(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, grad_out):
+    use_torch_flash_backward_recomputation = False
+
     softmax_denominator, Q, K, V, output = ctx.saved_tensors
-    return torch_flash_backward_recomputation(
-      Q=Q,
-      K=K,
-      V=V,
-      output=output,
-      d_output=grad_out,
-      softmax_denominator=softmax_denominator,
-      is_causal=ctx.is_causal,
-    )
+    assert len(Q.shape) == 3
+    assert Q.shape == K.shape
+    assert Q.shape == V.shape
+
+    if use_torch_flash_backward_recomputation:
+      return torch_flash_backward_recomputation(
+        Q=Q,
+        K=K,
+        V=V,
+        output=output,
+        d_output=grad_out,
+        softmax_denominator=softmax_denominator,
+        is_causal=ctx.is_causal,
+      )
+    else:
+      N_BATCHES, N_QUERIES, D = Q.shape
+      N_KEYS = K.shape[1]
+
+      Q_TILE_SIZE = 32
+      K_TILE_SIZE = 32
+
+      num_query_tiles = math.ceil(N_QUERIES / Q_TILE_SIZE)
+      num_key_tiles = math.ceil(N_KEYS / K_TILE_SIZE)
+
+      dQ = torch.empty(Q.shape, device=Q.device, dtype=Q.dtype)
+      dK = torch.empty(K.shape, device=K.device, dtype=K.dtype)
+      dV = torch.empty(V.shape, device=V.device, dtype=V.dtype)
+
+      flash_bwd_kernel[(num_query_tiles, num_key_tiles, N_BATCHES)](
+        Q,  # (B, Q, D)
+        K,  # (B, K, D)
+        V,  # (B, K, D)
+        output,  # (B, Q, D)
+        grad_out,  # (B, Q, D)
+        softmax_denominator,  # (B, Q)
+        dQ,  # (B, Q, D)
+        dK,  # (B, K, D)
+        dV,  # (B, K, D)
+        Q.stride()[0],
+        Q.stride()[1],
+        Q.stride()[2],
+        K.stride()[0],
+        K.stride()[1],
+        K.stride()[2],
+        V.stride()[0],
+        V.stride()[1],
+        V.stride()[2],
+        output.stride()[0],
+        output.stride()[1],
+        output.stride()[2],
+        grad_out.stride()[0],
+        grad_out.stride()[1],
+        grad_out.stride()[2],
+        softmax_denominator.stride()[0],
+        softmax_denominator.stride()[1],
+        dQ.stride()[0],
+        dQ.stride()[1],
+        dQ.stride()[2],
+        dK.stride()[0],
+        dK.stride()[1],
+        dK.stride()[2],
+        dV.stride()[0],
+        dV.stride()[1],
+        dV.stride()[2],
+        N_QUERIES,
+        N_KEYS,
+        1 / math.sqrt(D),
+        D,
+        Q_TILE_SIZE,
+        K_TILE_SIZE,
+        ctx.is_causal,
+      )
+    return dQ, dK, dV, None
 
 
 def create_benchmark_inputs(seq_len, emb_dim, dtype):
