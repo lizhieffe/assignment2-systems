@@ -485,6 +485,11 @@ def flash_bwd_kernel(
     )  # (Q_TILE_SIZE,)
 
     S_i = tl.dot(Q_i, K_j.T) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+    if is_causal:
+      q_range = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+      k_range = key_tile_idx * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+      mask = q_range[:, None] >= k_range[None, :]
+      S_i = tl.where(mask, S_i, -1e6)
 
     P_i = tl.exp(S_i - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
     dV_j_next = dV_j + tl.dot(P_i.T, dO_i)  # (K_TILE_SIZE, D)
@@ -575,7 +580,14 @@ def flash_bwd_kernel(
     V_j = tl.load(
       V_block_ptr, boundary_check=(0,), padding_option="zero"
     )  # (K_TILE_SIZE, D)
+
     S_i = tl.dot(Q_i, K_j.T) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+    if is_causal:
+      q_range = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+      k_range = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+      mask = q_range[:, None] >= k_range[None, :]
+      S_i = tl.where(mask, S_i, -1e6)
+
     P_i = tl.exp(S_i - L_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
     dP_i = tl.dot(dO_i, V_j.T)  # (Q_TILE_SIZE, K_TILE_SIZE)
     dS_i = P_i * (dP_i - D_i[:, None])  # (Q_TILE_SIZE, K_TILE_SIZE)
