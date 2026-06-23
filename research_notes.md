@@ -944,3 +944,24 @@ The asymmetry is a direct consequence of which half of the implementation is act
 - **Backward** (`torch_flash_backward_recomputation`) is *not* tiled or fused — it recomputes `S = Q @ Kᵀ` from scratch (an extra full matmul that plain PyTorch's autograd avoids, since it already has `S`/`P` saved from its own forward), then materializes the full `(N, N)` tensors `S`, `P`, `dP`, `dS` in global memory exactly like the plain implementation does. So it pays the *recomputation* cost (the whole point of saving memory in the forward pass) without getting the *fusion* benefit (the whole point of FlashAttention's speed) — it inherits the same O(N²) HBM traffic as plain attention's backward, plus one extra O(N²D) matmul on top, which is exactly why the slowdown is largest at the longest sequence lengths.
 
 Real production FlashAttention-2 backward kernels write this same recomputation as a fused, tiled `@triton.jit`/CUDA kernel (recomputing `S` tile-by-tile in shared memory/registers, never spilling the full `(N,N)` matrix to global memory), which is what lets their backward be competitive with — and often faster than — plain attention's backward at scale. Closing this gap here would require writing an actual `flash_bwd_kernel` in Triton rather than the current plain-PyTorch recomputation function.
+
+---
+
+## Section 5.1: Distributed Communication Benchmarking
+
+**Setup:** `cs336_systems/assignment_51_benchmark_dist_comm.py`, NCCL backend, `WORLD_SIZE=2`, one `int64` tensor of `MATRIX_SIZE` elements per rank, `dist.all_reduce(..., op=SUM)`. Timed region bracketed by `cuda.synchronize()` + `dist.barrier()` before, `cuda.synchronize()` after, to remove cross-rank start skew from the measurement (see barrier discussion above).
+
+### `all_reduce` latency vs. tensor size
+
+| Tensor size (elements) | Tensor size (MB, int64) | rank0 latency (s) | rank1 latency (s) |
+|---|---|---|---|
+| 3 | ~0.00002 | 0.00154 | 0.00135 |
+| 1,000,000 | ~7.6 | 0.00153 | 0.00137 |
+| 10,000,000 | ~76 | 0.00929 | 0.00898 |
+| 100,000,000 | ~763 | 0.08305 | 0.08288 |
+| 1,000,000,000 | ~7,630 | 0.81435 | 0.81414 |
+
+**Observations:**
+- Below ~1M elements, latency is flat at ~1.3–1.5 ms — dominated by fixed NCCL/kernel-launch overhead, not data volume.
+- From 1M → 1B elements (1000× data), latency grows from ~0.0015s → ~0.81s (~540×) — sub-linear vs. raw element count but consistent with bandwidth-bound scaling once payload exceeds the fixed-overhead regime (10M→100M is ~9×, 100M→1B is ~9.8×, both close to the 10× data growth — i.e. once past the small-message floor, latency scales linearly with size).
+- rank0 and rank1 latencies are within ~1–2% of each other at every size, confirming the `barrier()` fix removed the previous systematic skew where rank0 appeared ~100× slower than rank1 due to unsynchronized start times.
