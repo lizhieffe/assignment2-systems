@@ -965,3 +965,23 @@ Real production FlashAttention-2 backward kernels write this same recomputation 
 - Below ~1M elements, latency is flat at ~1.3–1.5 ms — dominated by fixed NCCL/kernel-launch overhead, not data volume.
 - From 1M → 1B elements (1000× data), latency grows from ~0.0015s → ~0.81s (~540×) — sub-linear vs. raw element count but consistent with bandwidth-bound scaling once payload exceeds the fixed-overhead regime (10M→100M is ~9×, 100M→1B is ~9.8×, both close to the 10× data growth — i.e. once past the small-message floor, latency scales linearly with size).
 - rank0 and rank1 latencies are within ~1–2% of each other at every size, confirming the `barrier()` fix removed the previous systematic skew where rank0 appeared ~100× slower than rank1 due to unsynchronized start times.
+
+---
+
+## Section 5.2: Naive DDP — Communication Cost
+
+**Setup:** `cs336_systems/assignment_52_naive_ddp.py`. `DDP` wraps a model, broadcasts initial params from rank 0, and registers a `post_accumulate_grad_hook` per parameter that calls `dist.all_reduce(param.grad, op=AVG)` as soon as that parameter's gradient finishes accumulating. Comm latency is measured per-parameter via CUDA events (`start_event`/`end_event` recorded directly on the stream) and summed across one backward pass — this avoids the CPU-wall-clock inflation that a naive `time.time()` + `dist.barrier()` approach introduces around async CUDA calls. `WORLD_SIZE=2`, NCCL backend, two RTX 3090s connected via PCIe (no NVLink).
+
+### Measured comm cost by model size (`USE_ASYNC_COMM=False`, `BATCH_SIZE=1`)
+
+| Config | FWD (s) | BWD (s) | Comm latency sum (s) | Comm % of BWD |
+|---|---|---|---|---|
+| `MODEL_CONFIG_S_SC` (bf16) | 0.258 | 0.205 | 0.036 | ~17% |
+| `MODEL_CONFIG_L_SC` (fp32) | 0.293 | 0.665 | 0.422 | ~63% |
+| `MODEL_CONFIG_XL_SC` (bf16) | 0.203 | 0.998 | 0.712 | ~71% |
+
+**Observations:**
+- With `use_async_comm=False`, every parameter's `all_reduce` fully blocks the single CPU thread driving the autograd engine before the next parameter's backward compute can even be queued — there is zero overlap between compute and comm, and comm consistently dominates backward time (17–71% across model sizes here). This is the motivation for `use_async_comm=True`: launching each `all_reduce` with `async_op=True` lets backward compute for earlier parameters continue while later parameters' gradients are still being communicated, with `finish_gradient_synchronization()` waiting on all outstanding handles only once, at the end.
+- Comm share of backward time grows with model size (S_SC 17% → XL_SC 71%) — larger parameter tensors mean more bytes to move per `all_reduce`, while compute-per-byte doesn't grow as fast at this model scale.
+- Because `_grad_all_reduce` fires once per parameter tensor (no gradient bucketing), every call pays a fixed dispatch cost (~10–100 μs: kernel launch + NCCL host-side bookkeeping + Python overhead) independent of tensor size. This is negligible for large parameters but can dominate for small ones (biases, LayerNorm weights) — the standard motivation for gradient bucketing in production DDP implementations.
+- Naive DDP keeps a full, unsharded model replica (weights + grads) on every GPU, so per-GPU memory footprint is `2 × (weights + grads)` minimum regardless of world size — this hits memory-pressure cliffs at much smaller model sizes than data-parallel compute throughput alone would suggest (e.g. `MODEL_CONFIG_XL_SC` requires bf16 rather than fp32 to fit comfortably on a 24GB card here).
