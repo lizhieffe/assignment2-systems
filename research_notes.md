@@ -968,20 +968,28 @@ Real production FlashAttention-2 backward kernels write this same recomputation 
 
 ---
 
-## Section 5.2: Naive DDP — Communication Cost
+## Section 5.2 / 5.3: Naive vs. Flattened-Gradient DDP — Communication Cost
 
-**Setup:** `cs336_systems/assignment_52_naive_ddp.py`. `DDP` wraps a model, broadcasts initial params from rank 0, and registers a `post_accumulate_grad_hook` per parameter that calls `dist.all_reduce(param.grad, op=AVG)` as soon as that parameter's gradient finishes accumulating. Comm latency is measured per-parameter via CUDA events (`start_event`/`end_event` recorded directly on the stream) and summed across one backward pass — this avoids the CPU-wall-clock inflation that a naive `time.time()` + `dist.barrier()` approach introduces around async CUDA calls. `WORLD_SIZE=2`, NCCL backend, two RTX 3090s connected via PCIe (no NVLink).
+**Setup (5.2, `cs336_systems/assignment_52_naive_ddp.py`):** `DDP` broadcasts initial params from rank 0 (no per-parameter hooks). `finish_gradient_synchronization()` is called once, explicitly, right after `loss.backward()` completes in the training loop: it loops over every parameter with `requires_grad` and calls `dist.all_reduce(p.grad, op=AVG, async_op=False)` for each one — a true per-parameter blocking baseline, one `all_reduce` call per parameter tensor.
 
-### Measured comm cost by model size (`USE_ASYNC_COMM=False`, `BATCH_SIZE=1`)
+**Setup (5.3, `cs336_systems/assignment_53_flattened_ddp.py`):** Same broadcast-at-init, no per-parameter hook either. `finish_gradient_synchronization()` flattens every parameter's `.grad` into a single contiguous buffer via `torch._utils._flatten_dense_tensors`, issues exactly one `dist.all_reduce(op=AVG, async_op=True)` on that buffer, waits on the handle, then unflattens and copies the reduced values back into each `param.grad` in place.
 
-| Config | FWD (s) | BWD (s) | Comm latency sum (s) | Comm % of BWD |
-|---|---|---|---|---|
-| `MODEL_CONFIG_S_SC` (bf16) | 0.258 | 0.205 | 0.036 | ~17% |
-| `MODEL_CONFIG_L_SC` (fp32) | 0.293 | 0.665 | 0.422 | ~63% |
-| `MODEL_CONFIG_XL_SC` (bf16) | 0.203 | 0.998 | 0.712 | ~71% |
+`WORLD_SIZE=2`, NCCL backend, two RTX 3090s connected via PCIe (no NVLink), `BATCH_SIZE=1`, bf16 in both scripts. Comm latency in both scripts is measured with CUDA events (`record()`/`synchronize()`) bracketing the relevant calls — this is load-bearing, not incidental: `dist.all_reduce(..., async_op=False)` only enqueues the NCCL kernel and inserts a stream-ordering dependency, it does **not** block the host thread, so a plain `time.time()` around it (as 5.2 originally did) undercounts by 2–3 orders of magnitude, measuring kernel-dispatch time instead of actual transfer time. This was caught and fixed in both scripts during this session (5.3 had the same class of bug from placing the event-record before `handle.wait()`).
+
+### Measured comm cost by model size
+
+| Config | Impl | FWD (s) | BWD (s) | Comm latency sum (s) | Comm % of BWD |
+|---|---|---|---|---|---|
+| `MODEL_CONFIG_S_SC` | 5.2 naive (per-param, blocking) | 0.244 | 0.191 | 0.0279 | ~15% |
+| `MODEL_CONFIG_S_SC` | 5.3 flattened (single call) | 0.251 | 0.187 | 0.0270 | ~14% |
+| `MODEL_CONFIG_L_SC` | 5.2 naive (per-param, blocking) | 0.187 | 0.438 | 0.2011 | ~46% |
+| `MODEL_CONFIG_L_SC` | 5.3 flattened (single call) | 0.187 | 0.452 | 0.2024 | ~45% |
+| `MODEL_CONFIG_XL_SC` | 5.2 naive (per-param, blocking) | 0.195 | 0.921 | 0.6972 | ~76% |
+| `MODEL_CONFIG_XL_SC` | 5.3 flattened (single call) | 0.205 | 0.988 | 0.7205 | ~73% |
 
 **Observations:**
-- With `use_async_comm=False`, every parameter's `all_reduce` fully blocks the single CPU thread driving the autograd engine before the next parameter's backward compute can even be queued — there is zero overlap between compute and comm, and comm consistently dominates backward time (17–71% across model sizes here). This is the motivation for `use_async_comm=True`: launching each `all_reduce` with `async_op=True` lets backward compute for earlier parameters continue while later parameters' gradients are still being communicated, with `finish_gradient_synchronization()` waiting on all outstanding handles only once, at the end.
-- Comm share of backward time grows with model size (S_SC 17% → XL_SC 71%) — larger parameter tensors mean more bytes to move per `all_reduce`, while compute-per-byte doesn't grow as fast at this model scale.
-- Because `_grad_all_reduce` fires once per parameter tensor (no gradient bucketing), every call pays a fixed dispatch cost (~10–100 μs: kernel launch + NCCL host-side bookkeeping + Python overhead) independent of tensor size. This is negligible for large parameters but can dominate for small ones (biases, LayerNorm weights) — the standard motivation for gradient bucketing in production DDP implementations.
-- Naive DDP keeps a full, unsharded model replica (weights + grads) on every GPU, so per-GPU memory footprint is `2 × (weights + grads)` minimum regardless of world size — this hits memory-pressure cliffs at much smaller model sizes than data-parallel compute throughput alone would suggest (e.g. `MODEL_CONFIG_XL_SC` requires bf16 rather than fp32 to fit comfortably on a 24GB card here).
+- With both scripts measured correctly, 5.2 (per-parameter blocking) and 5.3 (flatten-into-one-call) take essentially **the same real comm time** at every model size tested — within ~1-3% of each other. An earlier version of this table showed 5.3 as 7×–70× slower; that was entirely a measurement artifact in 5.2's original `time.time()`-based timing (see Setup above), not a real difference between the two approaches.
+- This makes sense once the timing is fixed: both implementations move the same total gradient bytes over the same link. Whether that's done as one big `all_reduce` or many small ones, the transfer is bandwidth-bound at these payload sizes on a PCIe-only (no NVLink), 2-GPU link, so total transfer time is dominated by bytes moved, not call count. 5.3's flatten/unflatten copies do add real (if small, since they're untimed in the comm-latency window but still present in BWD wall time) overhead, but it isn't large enough to produce a meaningfully different comm number here.
+- Neither implementation overlaps comm with backward compute itself — `finish_gradient_synchronization` is called only after `loss.backward()` returns in both scripts, so wall time is strictly `bwd_time + comm_time` in both cases. With these corrected numbers, comm is now a much larger fraction of backward time than previously reported (~15-76% rather than ~1-14%), making the case for overlapping comm with backward compute (true `async_op=True` *during* backward, registered via per-parameter hooks, not just at the end) considerably stronger than the earlier numbers suggested.
+- A production-grade middle ground buckets gradients into several flat buffers (e.g. ~25MB each, as in PyTorch's native DDP) so each bucket can be flattened and all-reduced as soon as it fills, overlapping with backward compute for later buckets — neither 5.2 nor 5.3 here implements that.
+- Naive DDP (and the flattened variant) both keep a full, unsharded model replica (weights + grads) on every GPU, so per-GPU memory footprint is `2 × (weights + grads)` minimum regardless of world size — this hits memory-pressure cliffs at much smaller model sizes than data-parallel compute throughput alone would suggest (e.g. `MODEL_CONFIG_XL_SC` requires bf16 rather than fp32 to fit comfortably on a 24GB card here).

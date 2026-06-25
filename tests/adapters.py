@@ -4,6 +4,7 @@ import torch
 
 from cs336_systems import (
   assignment_52_naive_ddp,
+  assignment_53_overlapped_ddp,
   triton_kernels_flash_attention_2,
 )
 
@@ -55,7 +56,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
       Instance of a DDP class.
   """
   # For example: return DDP(module)
-  return assignment_52_naive_ddp.DDP(module)
+  return assignment_53_overlapped_ddp.DDP(module)
 
 
 def ddp_on_after_backward(

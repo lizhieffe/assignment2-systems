@@ -25,31 +25,66 @@ from cs336_systems.model_configs import (  # noqa: F401
 
 MODEL_CONFIG = MODEL_CONFIG_S_SC
 MODEL_CONFIG_NAME = next(
-  name
-  for name, value in globals().items()
+  name for name, value in globals().items()
   if name.startswith("MODEL_CONFIG_") and value is MODEL_CONFIG
 )
 BATCH_SIZE = 1
 USE_GPU = True
 WORLD_SIZE = 2
+USE_ASYNC_COMM = False
 
 
 class DDP:
   """A wrapper to convert a nn.Module to a DDP module."""
 
-  def __init__(self, module: nn.Module):
+  def __init__(self, module: nn.Module, use_async_comm: bool = True):
     """
     Args:
       module: the model to wrap to convert to DDP model.
+      use_async_comm: if true, use async comm to overlap with the grad
+        computation in bwd pass.
+
     """
     self.module = module
+    self.use_async_comm = use_async_comm
 
+    self._handles: list[dist.Work] = []
     self._comm_latencies: list[float] = []  # sec
 
     for param in self.module.parameters():
       # The device 0 broadcast the initial params.
       with torch.no_grad():
         dist.broadcast(param.data, src=0)
+
+      # Skip the params that doesn't needs grad.
+      if param.requires_grad:
+        param.register_post_accumulate_grad_hook(self._grad_all_reduce)
+
+  def _grad_all_reduce(self, param: nn.Parameter) -> None:
+    is_cuda = param.grad.is_cuda
+    if not self.use_async_comm:
+      if is_cuda:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+      else:
+        start_time = time.time()
+
+    handle = dist.all_reduce(
+      param.grad, op=dist.ReduceOp.AVG, async_op=self.use_async_comm
+    )
+
+    if not self.use_async_comm:
+      if is_cuda:
+        # The GPU time is more accurate compared to time.time() CPU time.
+        end_event.record()
+        end_event.synchronize()
+        self._comm_latencies.append(start_event.elapsed_time(end_event) / 1000)
+      else:
+        self._comm_latencies.append(time.time() - start_time)
+
+    if handle is not None:
+      self._handles.append(handle)
 
   def named_parameters(self):
     return self.module.named_parameters()
@@ -61,45 +96,15 @@ class DDP:
     return self.module(x)
 
   def finish_gradient_synchronization(self):
-    """Only add_reduce once for the concat grad tensor."""
-    params = [p for p in self.module.parameters() if p.requires_grad]
-    handles = []
-
-    is_cuda = params[0].is_cuda
-    if is_cuda:
-      torch.cuda.synchronize()
-
-    dist.barrier()
-
-    if is_cuda:
-      start_event = torch.cuda.Event(enable_timing=True)
-      end_event = torch.cuda.Event(enable_timing=True)
-      start_event.record()
-    else:
-      start_time = time.time()
-
-    for p in params:
-      handle = dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=False)
-      if handle is not None:
-        handles.append(handle)
-
-    for handle in handles:
+    for handle in self._handles:
       handle.wait()
-    handles.clear()
-
-    # dist.all_reduce(async_op=False) only enqueues the NCCL kernel and
-    # returns without blocking the host, so a CUDA event (or an explicit
-    # torch.cuda.synchronize()) is required here to time actual completion
-    # rather than just kernel-dispatch time.
-    if is_cuda:
-      end_event.record()
-      end_event.synchronize()
-      self._comm_latencies.append(start_event.elapsed_time(end_event) / 1000)
-    else:
-      self._comm_latencies.append(time.time() - start_time)
+    self._handles.clear()
 
   def get_comm_latencies(self) -> list[float]:
-    """Get comm latencies."""
+    """Get comm latencies.
+
+    Only valid when the self.use_async_comm is False.
+    """
     return self._comm_latencies
 
 
@@ -132,6 +137,7 @@ def distributed_training(
   rank: int,
   world_size: int,
   use_gpu: bool,
+  use_async_comm: bool,
   batch_size: int,
 ) -> None:
   if use_gpu:
@@ -172,7 +178,7 @@ def distributed_training(
       num_heads=MODEL_CONFIG["num_heads"],
       d_ff=MODEL_CONFIG["d_ff"],
     ).to(device, dtype=torch.bfloat16)
-    ddp_lm = DDP(lm)
+    ddp_lm = DDP(lm, use_async_comm=use_async_comm)
 
     x = torch.randint(0, vocab_size, (batch_size, context_length)).to(
       device=device
@@ -188,14 +194,11 @@ def distributed_training(
       print(f"FWD used {time.time() - start_time:.5f} sec")
 
     loss = y.sum()
-    if use_gpu:
-      torch.cuda.synchronize()
 
     # Backward
     dist.barrier()
     start_time = time.time()
     loss.backward()
-    ddp_lm.finish_gradient_synchronization()
     if use_gpu:
       torch.cuda.synchronize()
     if rank == 0:
@@ -210,11 +213,14 @@ def distributed_training(
 
 
 def main():
-  print(f"{MODEL_CONFIG_NAME=} {USE_GPU=} {WORLD_SIZE=} {BATCH_SIZE=}")
+  print(
+    f"{MODEL_CONFIG_NAME=} {USE_GPU=} {WORLD_SIZE=} {USE_ASYNC_COMM=} "
+    f"{BATCH_SIZE=}"
+  )
 
   mp.spawn(
     fn=distributed_training,
-    args=(WORLD_SIZE, USE_GPU, BATCH_SIZE),
+    args=(WORLD_SIZE, USE_GPU, USE_ASYNC_COMM, BATCH_SIZE),
     nprocs=WORLD_SIZE,
   )
 

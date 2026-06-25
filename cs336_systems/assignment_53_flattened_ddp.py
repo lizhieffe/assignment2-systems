@@ -1,7 +1,7 @@
-# Assignment 5.2 - Naive DDP impl.
+# Assignment 5.3 - improved DDP impl.
 #
 # Run the code:
-# uv run cs336_systems/assignment_52_naive_ddp.py
+# uv run cs336_systems/assignment_53_flattened_ddp.py
 
 import os
 import time
@@ -63,14 +63,16 @@ class DDP:
   def finish_gradient_synchronization(self):
     """Only add_reduce once for the concat grad tensor."""
     params = [p for p in self.module.parameters() if p.requires_grad]
-    handles = []
+    grads = [p.grad for p in params]
 
-    is_cuda = params[0].is_cuda
-    if is_cuda:
+    flattened_grads = torch._utils._flatten_dense_tensors(grads)
+
+    if params[0].is_cuda:
       torch.cuda.synchronize()
 
     dist.barrier()
 
+    is_cuda = params[0].is_cuda
     if is_cuda:
       start_event = torch.cuda.Event(enable_timing=True)
       end_event = torch.cuda.Event(enable_timing=True)
@@ -78,25 +80,23 @@ class DDP:
     else:
       start_time = time.time()
 
-    for p in params:
-      handle = dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=False)
-      if handle is not None:
-        handles.append(handle)
+    handle = dist.all_reduce(
+      flattened_grads, op=dist.ReduceOp.AVG, async_op=True
+    )
+    handle.wait()
 
-    for handle in handles:
-      handle.wait()
-    handles.clear()
-
-    # dist.all_reduce(async_op=False) only enqueues the NCCL kernel and
-    # returns without blocking the host, so a CUDA event (or an explicit
-    # torch.cuda.synchronize()) is required here to time actual completion
-    # rather than just kernel-dispatch time.
     if is_cuda:
       end_event.record()
       end_event.synchronize()
       self._comm_latencies.append(start_event.elapsed_time(end_event) / 1000)
     else:
       self._comm_latencies.append(time.time() - start_time)
+
+    unflattened_grads = torch._utils._unflatten_dense_tensors(
+      flattened_grads, grads
+    )
+    for param, unflattened_grad in zip(params, unflattened_grads):
+      param.grad.copy_(unflattened_grad)
 
   def get_comm_latencies(self) -> list[float]:
     """Get comm latencies."""
