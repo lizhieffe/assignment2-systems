@@ -5,6 +5,7 @@ import torch
 from cs336_systems import (
   assignment_52_naive_ddp,
   assignment_53_overlapped_ddp,
+  assignment_6_zero1,
   triton_kernels_flash_attention_2,
 )
 
@@ -147,4 +148,6 @@ def get_sharded_optimizer(
   Returns:
       Instance of sharded optimizer.
   """
-  raise NotImplementedError
+  return assignment_6_zero1.ZeRO1(
+    params=params, optimizer_cls=optimizer_cls, **kwargs
+  )
