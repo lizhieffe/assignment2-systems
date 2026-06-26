@@ -976,20 +976,41 @@ Real production FlashAttention-2 backward kernels write this same recomputation 
 
 `WORLD_SIZE=2`, NCCL backend, two RTX 3090s connected via PCIe (no NVLink), `BATCH_SIZE=1`, bf16 in both scripts. Comm latency in both scripts is measured with CUDA events (`record()`/`synchronize()`) bracketing the relevant calls — this is load-bearing, not incidental: `dist.all_reduce(..., async_op=False)` only enqueues the NCCL kernel and inserts a stream-ordering dependency, it does **not** block the host thread, so a plain `time.time()` around it (as 5.2 originally did) undercounts by 2–3 orders of magnitude, measuring kernel-dispatch time instead of actual transfer time. This was caught and fixed in both scripts during this session (5.3 had the same class of bug from placing the event-record before `handle.wait()`).
 
-### Measured comm cost by model size
+**Warmup fix (this session):** both scripts originally "warmed up" by running `dist.all_reduce` on a tiny dummy 3-element tensor 5×, which warms the NCCL communicator but never touches the real model. Since each script runs a *single* forward+backward (no training loop), the timed FWD/BWD pass was also the *first* pass through the real model — paying for CUDA's lazy kernel/library loading (`cuLibraryLoadData`, first-use `cudnn`/`cublas`/elementwise kernel JIT) inside the measured window. This was visible in the old numbers below: FWD time was ~flat (0.187–0.244s) across `S_SC` → `XL_SC`, i.e. dominated by fixed cold-start cost rather than model size. Fixed by replacing the dummy warmup with one real, untimed forward+backward step through the actual model (gradients reset and comm-latency samples discarded afterward) before the timed run — the same fix already applied to `assignment_53_overlapped_ddp.py`. Re-running after the fix shows FWD now scales with model size as expected (e.g. 5.2: 0.016s → 0.049s → 0.044s for `S_SC` → `L_SC` → `XL_SC`).
+
+### Measured comm cost by model size (post warmup-fix)
 
 | Config | Impl | FWD (s) | BWD (s) | Comm latency sum (s) | Comm % of BWD |
 |---|---|---|---|---|---|
-| `MODEL_CONFIG_S_SC` | 5.2 naive (per-param, blocking) | 0.244 | 0.191 | 0.0279 | ~15% |
-| `MODEL_CONFIG_S_SC` | 5.3 flattened (single call) | 0.251 | 0.187 | 0.0270 | ~14% |
-| `MODEL_CONFIG_L_SC` | 5.2 naive (per-param, blocking) | 0.187 | 0.438 | 0.2011 | ~46% |
-| `MODEL_CONFIG_L_SC` | 5.3 flattened (single call) | 0.187 | 0.452 | 0.2024 | ~45% |
-| `MODEL_CONFIG_XL_SC` | 5.2 naive (per-param, blocking) | 0.195 | 0.921 | 0.6972 | ~76% |
-| `MODEL_CONFIG_XL_SC` | 5.3 flattened (single call) | 0.205 | 0.988 | 0.7205 | ~73% |
+| `MODEL_CONFIG_S_SC` | 5.2 naive (per-param, blocking) | 0.016 | 0.058 | 0.0280 | ~48% |
+| `MODEL_CONFIG_S_SC` | 5.3 flattened (single call) | 0.016 | 0.058 | 0.0265 | ~46% |
+| `MODEL_CONFIG_L_SC` | 5.2 naive (per-param, blocking) | 0.049 | 0.291 | 0.2031 | ~70% |
+| `MODEL_CONFIG_L_SC` | 5.3 flattened (single call) | 0.049 | 0.303 | 0.2046 | ~67% |
+| `MODEL_CONFIG_XL_SC` | 5.2 naive (per-param, blocking) | 0.044 | 0.807 | 0.7092 | ~88% |
+| `MODEL_CONFIG_XL_SC` | 5.3 flattened (single call) | 0.044 | 0.843 | 0.7126 | ~85% |
 
 **Observations:**
-- With both scripts measured correctly, 5.2 (per-parameter blocking) and 5.3 (flatten-into-one-call) take essentially **the same real comm time** at every model size tested — within ~1-3% of each other. An earlier version of this table showed 5.3 as 7×–70× slower; that was entirely a measurement artifact in 5.2's original `time.time()`-based timing (see Setup above), not a real difference between the two approaches.
+- With both scripts measured correctly (event-based comm timing + real-model warmup), 5.2 (per-parameter blocking) and 5.3 (flatten-into-one-call) take essentially **the same real comm time** at every model size tested — within ~1-3% of each other. An earlier version of this table showed 5.3 as 7×–70× slower; that was entirely a measurement artifact in 5.2's original `time.time()`-based timing (see Setup above), not a real difference between the two approaches.
 - This makes sense once the timing is fixed: both implementations move the same total gradient bytes over the same link. Whether that's done as one big `all_reduce` or many small ones, the transfer is bandwidth-bound at these payload sizes on a PCIe-only (no NVLink), 2-GPU link, so total transfer time is dominated by bytes moved, not call count. 5.3's flatten/unflatten copies do add real (if small, since they're untimed in the comm-latency window but still present in BWD wall time) overhead, but it isn't large enough to produce a meaningfully different comm number here.
-- Neither implementation overlaps comm with backward compute itself — `finish_gradient_synchronization` is called only after `loss.backward()` returns in both scripts, so wall time is strictly `bwd_time + comm_time` in both cases. With these corrected numbers, comm is now a much larger fraction of backward time than previously reported (~15-76% rather than ~1-14%), making the case for overlapping comm with backward compute (true `async_op=True` *during* backward, registered via per-parameter hooks, not just at the end) considerably stronger than the earlier numbers suggested.
+- Neither implementation overlaps comm with backward compute itself — `finish_gradient_synchronization` is called only after `loss.backward()` returns in both scripts, so wall time is strictly `bwd_time + comm_time` in both cases. With the warmup fix removing cold-start contamination from FWD/BWD, comm is now an even larger fraction of backward time than previously reported (~46-88% rather than ~14-76%), making the case for overlapping comm with backward compute (true `async_op=True` *during* backward, registered via per-parameter hooks, not just at the end — see `assignment_53_overlapped_ddp.py`) even stronger than the earlier numbers suggested.
 - A production-grade middle ground buckets gradients into several flat buffers (e.g. ~25MB each, as in PyTorch's native DDP) so each bucket can be flattened and all-reduced as soon as it fills, overlapping with backward compute for later buckets — neither 5.2 nor 5.3 here implements that.
+
+### Why is there no comm latency difference between many small calls and one big call?
+
+Both `DDP` classes were instrumented (this session) to additionally track, per `finish_gradient_synchronization()` invocation: total bytes all-reduced, number of `dist.all_reduce` calls issued, and the resulting **effective bandwidth** (`total bytes / comm time`). This turns the "are they really the same?" question into a measured quantity instead of an inference from latency alone.
+
+| Config | Impl | # all_reduce calls | Bytes moved | Comm time (s) | Effective bandwidth (GB/s) |
+|---|---|---|---|---|---|
+| `MODEL_CONFIG_S_SC` | 5.2 naive | 111 | 257.3 MB | 0.0282 | 9.13 |
+| `MODEL_CONFIG_S_SC` | 5.3 flattened | 1 | 257.3 MB | 0.0265 | 9.72 |
+| `MODEL_CONFIG_L_SC` | 5.2 naive | 327 | 1938.8 MB | 0.2062 | 9.41 |
+| `MODEL_CONFIG_L_SC` | 5.3 flattened | 1 | 1938.8 MB | 0.2059 | 9.42 |
+| `MODEL_CONFIG_XL_SC` | 5.2 naive | 291 | 6813.6 MB | 0.6978 | 9.76 |
+| `MODEL_CONFIG_XL_SC` | 5.3 flattened | 1 | 6813.6 MB | 0.7228 | 9.43 |
+
+**Why this happens:**
+- Despite the call count varying by **111×–327×** between the two implementations, effective bandwidth is essentially constant at **~9.1–9.8 GB/s** in both — call count has no measurable effect on throughput.
+- `nvidia-smi topo -m` shows the two GPUs connected via `NODE` (PCIe, traversing the host bridge between NUMA domains, no NVLink/P2P), and `nvidia-smi -q` reports a PCIe Gen4 link. A single Gen4 x16 link tops out around 25–31 GB/s unidirectional in practice, and routing through the host bridge between NUMA nodes (rather than direct GPU↔GPU P2P) caps it further — ~9-10 GB/s achieved here is consistent with that link being the bottleneck, not NCCL's per-call dispatch overhead.
+- 5.2's 111–327 `dist.all_reduce(async_op=False)` calls are issued back-to-back on the same CUDA stream with **only one** host-side `dist.barrier()` + CUDA-event pair bracketing the whole batch of calls (not one per call) — so the host never round-trips per call. The kernels queue and execute consecutively, and since each one immediately saturates the same physical link the next one is waiting on, the aggregate behaves like one continuous transfer of the same total bytes. This is why splitting into many small calls doesn't show the ~1.3-1.5ms-per-call fixed-overhead floor seen in the Section 5.1 benchmark — that floor applies to an *isolated* call with its own `barrier()`/sync round trip, not to calls pipelined back-to-back without intervening host synchronization.
+- Net takeaway: at this payload size and on this PCIe-only link, the bottleneck is the **physical link bandwidth**, not call dispatch count. Flattening gradients into one buffer therefore doesn't currently buy any comm-latency win on this hardware — its only real benefit here would be enabling future overlap with backward compute (a single all-reduce is easier to issue early/async than many), not reducing per-call overhead.
 - Naive DDP (and the flattened variant) both keep a full, unsharded model replica (weights + grads) on every GPU, so per-GPU memory footprint is `2 × (weights + grads)` minimum regardless of world size — this hits memory-pressure cliffs at much smaller model sizes than data-parallel compute throughput alone would suggest (e.g. `MODEL_CONFIG_XL_SC` requires bf16 rather than fp32 to fit comfortably on a 24GB card here).

@@ -1,11 +1,22 @@
-# Assignment 5.2 - Naive DDP impl.
+# Assignment 5.3 - overlapped DDP impl.
+#
+# This impl issues the grad all_reduce comm immediately after one layer
+# of grad finishes in BWD. It overlaps the comm with the computation
+# to save the latency.
 #
 # Run the code:
-# uv run cs336_systems/assignment_52_naive_ddp.py
+# uv run cs336_systems/assignment_53_overlapped_ddp.py
+#
+# Detailed profiling (using Nvidia Nsight Systems):
+# uv run nsys profile --trace=cuda,cudnn,cublas,osrt,nvtx --pytorch=functions-trace,autograd-shapes-nvtx --cudabacktrace=all --python-backtrace=cuda --gpu-metrics-devices=0 -- python cs336_systems/assignment_53_overlapped_ddp.py
+#
+# Less-detailed profiling:
+# uv run nsys profile -- python cs336_systems/assignment_53_overlapped_ddp.py
 
 import os
 import time
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -23,7 +34,7 @@ from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_XL_SC,
 )
 
-MODEL_CONFIG = MODEL_CONFIG_S_SC
+MODEL_CONFIG = MODEL_CONFIG_L_SC
 MODEL_CONFIG_NAME = next(
   name for name, value in globals().items()
   if name.startswith("MODEL_CONFIG_") and value is MODEL_CONFIG
@@ -31,7 +42,7 @@ MODEL_CONFIG_NAME = next(
 BATCH_SIZE = 1
 USE_GPU = True
 WORLD_SIZE = 2
-USE_ASYNC_COMM = False
+USE_ASYNC_COMM = True
 
 
 class DDP:
@@ -51,40 +62,44 @@ class DDP:
     self._handles: list[dist.Work] = []
     self._comm_latencies: list[float] = []  # sec
 
-    for param in self.module.parameters():
-      # The device 0 broadcast the initial params.
-      with torch.no_grad():
-        dist.broadcast(param.data, src=0)
+    with nvtx.range("ddp broadcast init params"):
+      for name, param in self.module.named_parameters():
+        # The device 0 broadcast the initial params.
+        with torch.no_grad():
+          dist.broadcast(param.data, src=0)
 
-      # Skip the params that doesn't needs grad.
-      if param.requires_grad:
-        param.register_post_accumulate_grad_hook(self._grad_all_reduce)
+        # Skip the params that doesn't needs grad.
+        if param.requires_grad:
+          param.register_post_accumulate_grad_hook(
+            lambda p, name=name: self._grad_all_reduce(p, name)
+          )
 
-  def _grad_all_reduce(self, param: nn.Parameter) -> None:
-    is_cuda = param.grad.is_cuda
-    if not self.use_async_comm:
-      if is_cuda:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-      else:
-        start_time = time.time()
+  def _grad_all_reduce(self, param: nn.Parameter, name: str) -> None:
+    with nvtx.range(f"all_reduce grad [{name}]"):
+      is_cuda = param.grad.is_cuda
+      if not self.use_async_comm:
+        if is_cuda:
+          start_event = torch.cuda.Event(enable_timing=True)
+          end_event = torch.cuda.Event(enable_timing=True)
+          start_event.record()
+        else:
+          start_time = time.time()
 
-    handle = dist.all_reduce(
-      param.grad, op=dist.ReduceOp.AVG, async_op=self.use_async_comm
-    )
+      handle = dist.all_reduce(
+        param.grad, op=dist.ReduceOp.AVG, async_op=self.use_async_comm
+      )
 
-    if not self.use_async_comm:
-      if is_cuda:
-        # The GPU time is more accurate compared to time.time() CPU time.
-        end_event.record()
-        end_event.synchronize()
-        self._comm_latencies.append(start_event.elapsed_time(end_event) / 1000)
-      else:
-        self._comm_latencies.append(time.time() - start_time)
+      if not self.use_async_comm:
+        if is_cuda:
+          # The GPU time is more accurate compared to time.time() CPU time.
+          end_event.record()
+          end_event.synchronize()
+          self._comm_latencies.append(start_event.elapsed_time(end_event) / 1000)
+        else:
+          self._comm_latencies.append(time.time() - start_time)
 
-    if handle is not None:
-      self._handles.append(handle)
+      if handle is not None:
+        self._handles.append(handle)
 
   def named_parameters(self):
     return self.module.named_parameters()
@@ -96,9 +111,10 @@ class DDP:
     return self.module(x)
 
   def finish_gradient_synchronization(self):
-    for handle in self._handles:
-      handle.wait()
-    self._handles.clear()
+    with nvtx.range("finish_gradient_synchronization"):
+      for handle in self._handles:
+        handle.wait()
+      self._handles.clear()
 
   def get_comm_latencies(self) -> list[float]:
     """Get comm latencies.
@@ -106,6 +122,10 @@ class DDP:
     Only valid when the self.use_async_comm is False.
     """
     return self._comm_latencies
+
+  def reset_comm_latencies(self) -> None:
+    """Clear comm latencies recorded so far, e.g. after a warmup run."""
+    self._comm_latencies.clear()
 
 
 def setup(
@@ -121,18 +141,23 @@ def setup(
   )
 
 
-def warmup(device: str, n: int) -> None:
-  """Warm up the dist comm.
-
-  Args:
-    device: the device
-    n: # of comm in the warmup.
-  """
-  for _ in range(n):
-    x = torch.randint(0, 10, (3,)).to(device=device)
-    dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=False)
+def forward_step(ddp_lm: DDP, x: torch.Tensor, use_gpu: bool) -> torch.Tensor:
+  """Run the forward pass through the DDP-wrapped model."""
+  y = ddp_lm(x)
+  if use_gpu:
+    torch.cuda.synchronize()
+  return y
 
 
+def backward_step(ddp_lm: DDP, loss: torch.Tensor, use_gpu: bool) -> None:
+  """Run the backward pass and wait for grad sync to finish."""
+  loss.backward()
+  ddp_lm.finish_gradient_synchronization()
+  if use_gpu:
+    torch.cuda.synchronize()
+
+
+@nvtx.range("distributed_training")
 def distributed_training(
   rank: int,
   world_size: int,
@@ -158,15 +183,6 @@ def distributed_training(
   )
 
   try:
-    # Warmup
-    dist.barrier()
-    start_time = time.time()
-    warmup(device=device, n=5)
-    if use_gpu:
-      torch.cuda.synchronize()
-    if rank == 0:
-      print(f"Warm up used {time.time() - start_time:.5f} sec")
-
     vocab_size = MODEL_CONFIG["vocab_size"]
     context_length = MODEL_CONFIG["context_length"]
 
@@ -184,12 +200,20 @@ def distributed_training(
       device=device
     )
 
+    # Warmup: run a real forward/backward step (unprofiled, untimed) so
+    # that CUDA lazy kernel/library loading happens before the timed run.
+    dist.barrier()
+    y = forward_step(ddp_lm, x, use_gpu)
+    backward_step(ddp_lm, y.sum(), use_gpu)
+    for param in ddp_lm.parameters():
+      param.grad = None
+    ddp_lm.reset_comm_latencies()
+
     # Forward
     dist.barrier()
     start_time = time.time()
-    y = ddp_lm(x)
-    if use_gpu:
-      torch.cuda.synchronize()
+    with nvtx.range("forward pass"):
+      y = forward_step(ddp_lm, x, use_gpu)
     if rank == 0:
       print(f"FWD used {time.time() - start_time:.5f} sec")
 
@@ -198,9 +222,8 @@ def distributed_training(
     # Backward
     dist.barrier()
     start_time = time.time()
-    loss.backward()
-    if use_gpu:
-      torch.cuda.synchronize()
+    with nvtx.range("backward pass"):
+      backward_step(ddp_lm, loss, use_gpu)
     if rank == 0:
       print(f"BWD used {time.time() - start_time:.5f} sec")
 

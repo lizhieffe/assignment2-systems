@@ -45,6 +45,8 @@ class DDP:
     self.module = module
 
     self._comm_latencies: list[float] = []  # sec
+    self._comm_bytes: list[int] = []  # total bytes all-reduced per call
+    self._comm_num_calls: list[int] = []  # # of all_reduce calls per step
 
     for param in self.module.parameters():
       # The device 0 broadcast the initial params.
@@ -98,9 +100,28 @@ class DDP:
     else:
       self._comm_latencies.append(time.time() - start_time)
 
+    self._comm_bytes.append(
+      sum(p.grad.numel() * p.grad.element_size() for p in params)
+    )
+    self._comm_num_calls.append(len(params))
+
   def get_comm_latencies(self) -> list[float]:
     """Get comm latencies."""
     return self._comm_latencies
+
+  def get_comm_bytes(self) -> list[int]:
+    """Get total bytes all-reduced per `finish_gradient_synchronization` call."""
+    return self._comm_bytes
+
+  def get_comm_num_calls(self) -> list[int]:
+    """Get # of `dist.all_reduce` calls per `finish_gradient_synchronization` call."""
+    return self._comm_num_calls
+
+  def reset_comm_stats(self) -> None:
+    """Clear comm stats recorded so far, e.g. after a warmup run."""
+    self._comm_latencies.clear()
+    self._comm_bytes.clear()
+    self._comm_num_calls.clear()
 
 
 def setup(
@@ -116,16 +137,21 @@ def setup(
   )
 
 
-def warmup(device: str, n: int) -> None:
-  """Warm up the dist comm.
+def forward_backward_step(
+  ddp_lm: DDP, x: torch.Tensor, use_gpu: bool
+) -> torch.Tensor:
+  """Run one forward + backward step through the DDP-wrapped model."""
+  y = ddp_lm(x)
+  if use_gpu:
+    torch.cuda.synchronize()
 
-  Args:
-    device: the device
-    n: # of comm in the warmup.
-  """
-  for _ in range(n):
-    x = torch.randint(0, 10, (3,)).to(device=device)
-    dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=False)
+  loss = y.sum()
+  loss.backward()
+  ddp_lm.finish_gradient_synchronization()
+  if use_gpu:
+    torch.cuda.synchronize()
+
+  return loss
 
 
 def distributed_training(
@@ -152,15 +178,6 @@ def distributed_training(
   )
 
   try:
-    # Warmup
-    dist.barrier()
-    start_time = time.time()
-    warmup(device=device, n=5)
-    if use_gpu:
-      torch.cuda.synchronize()
-    if rank == 0:
-      print(f"Warm up used {time.time() - start_time:.5f} sec")
-
     vocab_size = MODEL_CONFIG["vocab_size"]
     context_length = MODEL_CONFIG["context_length"]
 
@@ -177,6 +194,14 @@ def distributed_training(
     x = torch.randint(0, vocab_size, (batch_size, context_length)).to(
       device=device
     )
+
+    # Warmup: run a real forward/backward step (untimed) so that CUDA
+    # lazy kernel/library loading happens before the timed run below.
+    dist.barrier()
+    forward_backward_step(ddp_lm, x, use_gpu)
+    for param in ddp_lm.parameters():
+      param.grad = None
+    ddp_lm.reset_comm_stats()
 
     # Forward
     dist.barrier()
@@ -202,8 +227,16 @@ def distributed_training(
       print(f"BWD used {time.time() - start_time:.5f} sec")
 
     comm_latencies = ddp_lm.get_comm_latencies()
+    comm_bytes = sum(ddp_lm.get_comm_bytes())
+    comm_num_calls = sum(ddp_lm.get_comm_num_calls())
+    comm_time = sum(comm_latencies)
     if rank == 0:
-      print(f"Comm latencies sum: {sum(comm_latencies):.5f} sec")
+      print(f"Comm latencies sum: {comm_time:.5f} sec")
+      print(f"Comm # all_reduce calls: {comm_num_calls}")
+      print(f"Comm bytes: {comm_bytes / 1e6:.3f} MB")
+      print(
+        f"Comm effective bandwidth: {comm_bytes / comm_time / 1e9:.3f} GB/s"
+      )
 
   finally:
     dist.destroy_process_group()
