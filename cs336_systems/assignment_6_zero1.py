@@ -24,16 +24,17 @@ from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_XL_SC,
 )
 
-MODEL_CONFIG = MODEL_CONFIG_S_SC
+MODEL_CONFIG = MODEL_CONFIG_S
 MODEL_CONFIG_NAME = next(
   name
   for name, value in globals().items()
   if name.startswith("MODEL_CONFIG_") and value is MODEL_CONFIG
 )
 
-BATCH_SIZE = 1
-USE_GPU = False
+BATCH_SIZE = 16
+USE_GPU = True
 WORLD_SIZE = 2
+USE_ZERO1_OPTIMIZER = True
 
 
 class ZeRO1(torch.optim.Optimizer):
@@ -102,7 +103,12 @@ def setup(
 
 
 def distributed_train(
-  rank: int, world_size: int, use_gpu: bool, model_config: dict[str, Any]
+  rank: int,
+  world_size: int,
+  use_gpu: bool,
+  model_config: dict[str, Any],
+  batch_size: int,
+  user_zero1_optimizer: bool,
 ):
   if use_gpu:
     assert torch.cuda.is_available(), "GPU is not available"
@@ -111,6 +117,7 @@ def distributed_train(
       f"Less GPU {device_count} than world size {world_size}"
     )
     device = f"cuda:{rank}"
+    torch.cuda.set_device(device)
   else:
     device = "cpu"
   if rank == 0:
@@ -126,6 +133,7 @@ def distributed_train(
   vocab_size = model_config["vocab_size"]
   context_length = model_config["context_length"]
 
+  hbm_before_model = torch.cuda.memory_allocated()
   m = model.BasicsTransformerLM(
     vocab_size=vocab_size,
     context_length=context_length,
@@ -133,11 +141,26 @@ def distributed_train(
     num_layers=MODEL_CONFIG["num_layers"],
     num_heads=MODEL_CONFIG["num_heads"],
     d_ff=MODEL_CONFIG["d_ff"],
+    # ).to(device)
   ).to(device, dtype=torch.bfloat16)
   ddp_m = assignment_52_naive_ddp.DDP(m)
-  opt = optimizer.AdamW(m.parameters())
+  if rank == 0:
+    print(
+      f"Model static mem: {(torch.cuda.memory_allocated() - hbm_before_model) / 1024**2:.2f} MB"
+    )
 
-  x = torch.randint(0, vocab_size, (1, context_length))
+  # optimizer's own params are lazy initialized. So it will show 0 here if we measure it.
+  if user_zero1_optimizer:
+    opt = ZeRO1(ddp_m.parameters(), optimizer.AdamW)
+  else:
+    opt = optimizer.AdamW(ddp_m.parameters())
+
+  hbm_before_input = torch.cuda.memory_allocated()
+  x = torch.randint(0, vocab_size, (batch_size, context_length)).to(device)
+  if rank == 0:
+    print(
+      f"Input tensor mem: {(torch.cuda.memory_allocated() - hbm_before_input) / 1024**1:.2f} KB"
+    )
 
   # FWD + BWD
   torch.cuda.reset_peak_memory_stats()
@@ -148,21 +171,30 @@ def distributed_train(
   ddp_m.finish_gradient_synchronization()
 
   peak = torch.cuda.max_memory_allocated() / 1024**2
-  print(f"Peak memory usage for FWD + BWD = {peak:.2f} MB")
+  if rank == 0:
+    print(f"[{rank=}] Peak memory usage for FWD + BWD = {peak:.2f} MB")
 
   # optimizer step
+  hbm_before_optimizer_step = torch.cuda.memory_allocated()
   torch.cuda.reset_peak_memory_stats()
   opt.step()
   peak = torch.cuda.max_memory_allocated() / 1024**2
-  print(f"Peak memory usage for optimizer step = {peak:.2f} MB")
+  if rank == 0:
+    print(f"[{rank=}] Peak memory usage for optimizer step = {peak:.2f} MB")
+    print(
+      f"Optimizier state mem = {(torch.cuda.memory_allocated() - hbm_before_optimizer_step) / 1024**2:.2f} MB"
+    )
+  dist.destroy_process_group()
 
 
 def main():
-  print(f"{USE_GPU=} {WORLD_SIZE=} {MODEL_CONFIG_NAME=}")
+  print(
+    f"{USE_GPU=} {WORLD_SIZE=} {MODEL_CONFIG_NAME=} {BATCH_SIZE=} {USE_ZERO1_OPTIMIZER=}"
+  )
   world_size = WORLD_SIZE
   mp.spawn(
     fn=distributed_train,
-    args=(world_size, USE_GPU, MODEL_CONFIG),
+    args=(world_size, USE_GPU, MODEL_CONFIG, BATCH_SIZE, USE_ZERO1_OPTIMIZER),
     nprocs=world_size,
     join=True,
   )
