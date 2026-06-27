@@ -5,14 +5,33 @@ import logging
 import math
 import os
 import warnings
+from contextlib import contextmanager
 
 import einx
 import torch
-import torch.cuda.nvtx as nvtx
+import torch.cuda.nvtx as _nvtx
 import torch.nn as nn
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+try:
+  _nvtx.range_push("nvtx_availability_check")
+  _nvtx.range_pop()
+  _NVTX_AVAILABLE = True
+except RuntimeError:
+  _NVTX_AVAILABLE = False
+
+
+class nvtx:
+  @staticmethod
+  @contextmanager
+  def range(msg, *args, **kwargs):
+    if _NVTX_AVAILABLE:
+      with _nvtx.range(msg, *args, **kwargs):
+        yield
+    else:
+      yield
 
 from cs336_basics.nn_utils import softmax
 

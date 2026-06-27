@@ -1,5 +1,8 @@
 # Assignment 5.2 - Naive DDP impl.
 #
+# The naive DDP sync the grads at the end of BWD layer by layer.
+# It doesn't have comm overlap or the flattened grads.
+#
 # Run the code:
 # uv run cs336_systems/assignment_52_naive_ddp.py
 

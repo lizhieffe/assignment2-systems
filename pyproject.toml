@@ -19,10 +19,10 @@ dependencies = [
     "ruff>=0.15.10",
     "ninja",
     # CUDA 13.0 compiler stack — must match torch 2.11+cu130
-    "nvidia-cuda-nvcc==13.0.88",
-    "nvidia-cuda-cccl==13.0.85",
-    "nvidia-nvvm==13.0.88",
-    "nvidia-cuda-crt==13.0.88",
+    "nvidia-cuda-nvcc==13.0.88; sys_platform == 'linux'",
+    "nvidia-cuda-cccl==13.0.85; sys_platform == 'linux'",
+    "nvidia-nvvm==13.0.88; sys_platform == 'linux'",
+    "nvidia-cuda-crt==13.0.88; sys_platform == 'linux'",
 ]
 
 [build-system]
