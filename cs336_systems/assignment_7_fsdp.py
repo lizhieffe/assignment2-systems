@@ -64,11 +64,10 @@ def is_norm_layer(module: nn.Module) -> bool:
 
 
 def is_shard_layer(module: nn.Module) -> bool:
-  # return True
-  ret = isinstance(module, (model.Linear, model.Embedding))
-  if dist.get_rank() == 0:
-    print(f"{type(module)=} is_shard_layer={ret}")
-  return ret
+  is_replicated_layer = isinstance(
+    module, (model.RMSNorm, model.RotaryEmbedding)
+  ) or is_norm_layer(module)
+  return not is_replicated_layer
 
 
 def get_named_layers(module: nn.Module) -> list[tuple[str, nn.Module]]:
