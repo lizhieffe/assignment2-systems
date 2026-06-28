@@ -24,14 +24,14 @@ from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_XL_SC,
 )
 
-MODEL_CONFIG = MODEL_CONFIG_S
+MODEL_CONFIG = MODEL_CONFIG_L_SC
 MODEL_CONFIG_NAME = next(
   name
   for name, value in globals().items()
   if name.startswith("MODEL_CONFIG_") and value is MODEL_CONFIG
 )
 
-BATCH_SIZE = 16
+BATCH_SIZE = 2
 USE_GPU = True
 WORLD_SIZE = 2
 USE_ZERO1_OPTIMIZER = True
@@ -162,17 +162,27 @@ def distributed_train(
       f"Input tensor mem: {(torch.cuda.memory_allocated() - hbm_before_input) / 1024**1:.2f} KB"
     )
 
-  # FWD + BWD
+  # FWD
   torch.cuda.reset_peak_memory_stats()
-
   y = ddp_m(x)
   loss = y.sum()
-  loss.backward()
-  ddp_m.finish_gradient_synchronization()
-
   peak = torch.cuda.max_memory_allocated() / 1024**2
   if rank == 0:
-    print(f"[{rank=}] Peak memory usage for FWD + BWD = {peak:.2f} MB")
+    print(f"[{rank=}] Peak memory usage for FWD = {peak:.2f} MB")
+
+  # BWD
+  torch.cuda.reset_peak_memory_stats()
+  loss.backward()
+  peak = torch.cuda.max_memory_allocated() / 1024**2
+  if rank == 0:
+    print(f"[{rank=}] Peak memory usage for BWD = {peak:.2f} MB")
+
+  # finish_gradient_synchronization
+  torch.cuda.reset_peak_memory_stats()
+  ddp_m.finish_gradient_synchronization()
+  peak = torch.cuda.max_memory_allocated() / 1024**2
+  if rank == 0:
+    print(f"[{rank=}] Peak memory usage for finish_gradient_synchronization = {peak:.2f} MB")
 
   # optimizer step
   hbm_before_optimizer_step = torch.cuda.memory_allocated()

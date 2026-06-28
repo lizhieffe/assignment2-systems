@@ -26,14 +26,14 @@ from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_XL_SC,
 )
 
-MODEL_CONFIG = MODEL_CONFIG_S
+MODEL_CONFIG = MODEL_CONFIG_L_SC
 MODEL_CONFIG_NAME = next(
   name
   for name, value in globals().items()
   if name.startswith("MODEL_CONFIG_") and value is MODEL_CONFIG
 )
 
-BATCH_SIZE = 16
+BATCH_SIZE = 2
 USE_GPU = True
 WORLD_SIZE = 2
 
@@ -162,6 +162,8 @@ class FSDP(torch.nn.Module):
     # Step 3 - get all layers for forward layer sync.//
     for layer in self.all_shard_layers:
       layer.register_forward_pre_hook(self._fwd_params_sync_hook)
+      layer.register_forward_hook(self._fwd_params_release_hook)
+      layer.register_full_backward_pre_hook(self._bwd_params_sync_hook)
 
     for param in self.module.parameters():
       if param.requires_grad:
@@ -226,6 +228,19 @@ class FSDP(torch.nn.Module):
       comm_layer = self.all_shard_layers[comm_idx]
       self._all_gather_params_for_layer(comm_layer)
 
+  def _fwd_params_release_hook(self, module: nn.Module, input, output):
+    for param in module.parameters():
+      chunks = param.data.chunk(chunks=self.world_size, dim=0)
+      param.data = chunks[self.rank]
+
+  def _bwd_params_sync_hook(self, module: nn.Module, _grad_output):
+    # Fires before this layer's backward computation runs, so we re-gather
+    # the full-size weights here (they were released right after this
+    # layer's forward returned by _fwd_params_release_hook).
+    if module not in self.all_shard_layers_to_idx:
+      raise ValueError("bwd_params_sync_hook is triggered on non shard layer.")
+    self._all_gather_params_for_layer(module)
+
   def _bwd_grads_sync_hook(self, param: nn.Parameter) -> None:
     assert param.requires_grad
     if param in self.shard_params:
@@ -235,6 +250,8 @@ class FSDP(torch.nn.Module):
         output=local_chunk, input_list=chunks, op=dist.ReduceOp.AVG
       )
       param.grad.data = local_chunk
+
+      param.data = param.data.chunk(chunks=self.world_size, dim=0)[self.rank]
     else:
       dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
@@ -298,13 +315,28 @@ def distributed_train(
 
     x = torch.randint(0, vocab_size, (batch_size, context_length)).to(device)
 
+    torch.cuda.reset_peak_memory_stats()
     y = fsdp_m(x)
     loss = y.sum()
+    hbm_fwd_mb = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"{hbm_fwd_mb=:.2f}")
 
+    torch.cuda.reset_peak_memory_stats()
     loss.backward()
-    fsdp_m.finish_gradient_synchronization()
+    hbm_bwd_mb = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"{hbm_bwd_mb=:.2f}")
 
+    torch.cuda.reset_peak_memory_stats()
+    fsdp_m.finish_gradient_synchronization()
+    hbm_finish_gradient_synchronization_mb = (
+      torch.cuda.max_memory_allocated() / 1024**2
+    )
+    print(f"{hbm_finish_gradient_synchronization_mb=:.2f}")
+
+    torch.cuda.reset_peak_memory_stats()
     opt.step()
+    hbm_opt_step_mb = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"{hbm_opt_step_mb=:.2f}")
 
   finally:
     dist.destroy_process_group()
