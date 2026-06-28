@@ -137,10 +137,10 @@ def distributed_train(
   m = model.BasicsTransformerLM(
     vocab_size=vocab_size,
     context_length=context_length,
-    d_model=MODEL_CONFIG["d_model"],
-    num_layers=MODEL_CONFIG["num_layers"],
-    num_heads=MODEL_CONFIG["num_heads"],
-    d_ff=MODEL_CONFIG["d_ff"],
+    d_model=model_config["d_model"],
+    num_layers=model_config["num_layers"],
+    num_heads=model_config["num_heads"],
+    d_ff=model_config["d_ff"],
     # ).to(device)
   ).to(device, dtype=torch.bfloat16)
   ddp_m = assignment_52_naive_ddp.DDP(m)

@@ -6,6 +6,7 @@ from cs336_systems import (
   assignment_52_naive_ddp,
   assignment_53_overlapped_ddp,
   assignment_6_zero1,
+  assignment_7_fsdp,
   triton_kernels_flash_attention_2,
 )
 
@@ -94,7 +95,7 @@ def get_fsdp(
       Instance of an FSDP class.
   """
   # For example: return FSDP(module, compute_dtype=compute_dtype)
-  raise NotImplementedError
+  return assignment_7_fsdp.FSDP(module=module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(
@@ -110,8 +111,7 @@ def fsdp_on_after_backward(
       optimizer: torch.optim.Optimizer
           Optimizer being used with the FSDP-wrapped model.
   """
-  # For example: fsdp_model.finish_gradient_synchronization()
-  raise NotImplementedError
+  fsdp_model.finish_gradient_synchronization()
 
 
 def fsdp_gather_full_params(
@@ -127,7 +127,7 @@ def fsdp_gather_full_params(
   Returns:
       State dictionary mapping parameter names to full (unsharded) tensors.
   """
-  raise NotImplementedError
+  return fsdp_model.gather_full_params()
 
 
 def get_sharded_optimizer(
