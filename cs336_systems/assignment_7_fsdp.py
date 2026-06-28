@@ -129,6 +129,7 @@ class FSDP(torch.nn.Module):
     self.world_size = dist.get_world_size()
 
     self.shard_params: set[nn.Parameter] = set()
+    self.full_precision_shard_params: dict[nn.Parameter, torch.Tensor] = {}
 
     # Step 0 - get all layers that need to shard.
     all_named_layers = get_named_layers(self.module)
@@ -151,7 +152,7 @@ class FSDP(torch.nn.Module):
 
         # Step 2 - Replace each param's full-size data with just
         # its local shard, so the rest of the original storage can be freed.
-        p.data = local_chunk
+        p.data = local_chunk.detach()
 
     # Here we don't sync for the replicated layers because they are
     # RMSNorm and the initialized params are all 1s.
@@ -166,13 +167,17 @@ class FSDP(torch.nn.Module):
       if param.requires_grad:
         param.register_post_accumulate_grad_hook(self._bwd_grads_sync_hook)
 
-    # Step
-    # local_layers = get_local_layers(
-    #   layers, world_size=self.world_size, rank=self.rank
-    # )
-    # print(f"{local_layers=}")
-
   def forward(self, *inputs, **kwargs):
+    # At the beginning of the forward, it is expected that the param.data
+    # is full precision and most up to date. We copy them to
+    # self.full_precision_shard_params, and then cast them to compute_dtype
+    # so that the FWD/BWD/comm will use compute_dtype
+    for param in self.shard_params:
+      self.full_precision_shard_params[param] = param.data
+      param.data = self.full_precision_shard_params[param].to(
+        self.compute_dtype
+      )
+
     # Sync the params for the first 2 layers.
     assert len(self.all_shard_layers) >= 2
     self._all_gather_params_for_layer(self.all_shard_layers[0])
@@ -184,14 +189,17 @@ class FSDP(torch.nn.Module):
     return self.module.parameters(recurse)
 
   def finish_gradient_synchronization(self) -> None:
-    """Release the parameters that don't belong to this GPU.
+    """Called after BWD and before optimizer.step()."""
+    for param in self.shard_params:
+      # This line serves two purposes:
+      # 1. Release the param that doesn't belong to the current GPU.
+      # 2. Load the full precision param to prepare for optimizer.step()
+      param.data = self.full_precision_shard_params[param]
 
-    Called after BWD and before optimizer.step().
-    """
-    for layer in self.all_shard_layers:
-      for param in layer.parameters():
-        chunks = param.data.detach().chunk(chunks=self.world_size, dim=0)
-        param.data = chunks[self.rank]
+      # Cast the grad to full precision to prepare for optimizer.step()
+      # Otherwise the SGD implementation will throw error if the grad
+      # has different dtype compared to the weight.
+      param.grad.data = param.grad.data.to(torch.float32)
 
   def _all_gather_params_for_layer(self, layer: nn.Module) -> None:
     # Sync for each parameter in the layer.
