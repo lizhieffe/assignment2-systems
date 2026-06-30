@@ -6,7 +6,7 @@ from cs336_systems import (
   assignment_52_naive_ddp,
   assignment_53_overlapped_ddp,
   assignment_6_zero1,
-  assignment_7_fsdp,
+  assignment_7_fsdp_v2 as assignment_7_fsdp,
   triton_kernels_flash_attention_2,
 )
 
