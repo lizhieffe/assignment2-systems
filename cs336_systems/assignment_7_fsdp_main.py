@@ -13,8 +13,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cs336_basics import model, optimizer
 
-import assignment_7_fsdp as fsdp_lib
-# import assignment_7_fsdp_v2 as fsdp_lib
+import assignment_7_fsdp_v1 as fsdp_lib
+#import assignment_7_fsdp_v2 as fsdp_lib
 
 from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_S,
@@ -28,7 +28,7 @@ from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_XL_SC,
 )
 
-MODEL_CONFIG = MODEL_CONFIG_L_SC
+MODEL_CONFIG = MODEL_CONFIG_S
 MODEL_CONFIG_NAME = next(
   name
   for name, value in globals().items()

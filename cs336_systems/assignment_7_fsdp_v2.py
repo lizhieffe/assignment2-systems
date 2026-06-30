@@ -92,8 +92,10 @@ class FSDPFunction(torch.autograd.Function):
         grad_weight_full = (grad_out_flat.t() @ input_flat).to(torch.float32)
         grad_weight_full /= wrapper.world_size
 
-        # Reduce-scatter asynchronously
-        grad_weight = torch.empty_like(weight.data)
+        # Reduce-scatter asynchronously (must be float32 to match grad_weight_full)
+        grad_weight = torch.empty(
+          weight.data.shape, dtype=torch.float32, device=weight.data.device
+        )
         if wrapper.world_size > 1:
           work_w = dist.reduce_scatter_tensor(
             grad_weight, grad_weight_full, async_op=True
@@ -119,7 +121,9 @@ class FSDPFunction(torch.autograd.Function):
         grad_bias_full = grad_out_flat.sum(dim=0).to(torch.float32)
         grad_bias_full /= wrapper.world_size
 
-        grad_bias = torch.empty_like(bias.data)
+        grad_bias = torch.empty(
+          bias.data.shape, dtype=torch.float32, device=bias.data.device
+        )
         if wrapper.world_size > 1:
           work_b = dist.reduce_scatter_tensor(
             grad_bias, grad_bias_full, async_op=True
@@ -144,7 +148,9 @@ class FSDPFunction(torch.autograd.Function):
         grad_weight_full.index_add_(0, input_flat, grad_out_flat)
         grad_weight_full /= wrapper.world_size
 
-        grad_weight = torch.empty_like(weight.data)
+        grad_weight = torch.empty(
+          weight.data.shape, dtype=torch.float32, device=weight.data.device
+        )
         if wrapper.world_size > 1:
           work_w = dist.reduce_scatter_tensor(
             grad_weight, grad_weight_full, async_op=True
