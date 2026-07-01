@@ -6,33 +6,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import einops
+import jaxtyping
 
 from cs336_basics import model, optimizer
 
-
-def get_named_leaf_modules(root: nn.Module) -> list[tuple[str, nn.Module]]:
-  ret = []
-
-  for name, child in root.named_children():
-    if child == root:
-      continue
-    if len(list(child.children())) == 0:
-      ret.append((name, child))
-    else:
-      ret.extend(get_named_leaf_modules(child))
-
-  return ret
+from cs336_systems.nn_module_util import get_leaf_modules, get_leaf_module_types
 
 
-def get_leaf_modules(root: nn.Module) -> list[nn.Module]:
-  named_leaf_modules = get_named_leaf_modules(root)
-  return [m for (_, m) in named_leaf_modules]
+class FSDPLinearFunction(torch.autograd.Function):
+  @staticmethod
+  def forward(ctx, wrapper, input_tensor, weight):
+    """
+    Args:
+      ctx: Context object to save information for backward pass.
+      input_tensor: (..., D_in).
+      weight: (D_out, D_in).
+    """
+    ctx.save_for_backward(input_tensor, weight)
+    ctx.world_size = wrapper.world_size
 
+    chunks = [torch.empty_like(weight) for _ in range(wrapper.world_size)]
+    dist.all_gather(tensor_list=chunks, tensor=weight)
+    full_weight = torch.concat(chunks, dim=0)
+    y = einops.einsum(
+      input_tensor, full_weight, "... d_in, d_out d_in -> ... d_out"
+    )
 
-def get_leaf_module_types(root: nn.Module) -> set[type[nn.Module]]:
-  leaf_modules = get_leaf_modules(root)
-  leaf_module_types = [type(m) for m in leaf_modules]
-  return set(leaf_module_types)
+    return y
+
+  @staticmethod
+  def backward(ctx, grad_output):
+    grad_output = grad_output  # (..., D_out)
+    input_tensor = ctx.saved_tensors[0]  # (..., D_in)
+    weight = ctx.saved_tensors[1]  # (D_out / world_size, D_in)
+    world_size = ctx.world_size
+
+    # Get the full weight.
+    chunks = [torch.empty_like(weight) for _ in range(world_size)]
+    dist.all_gather(tensor_list=chunks, tensor=weight)
+    full_weight = torch.concat(chunks, dim=0)
+
+    grad_input = einops.einsum(
+      grad_output, full_weight, "... d_out, d_out d_in -> ... d_in"
+    )
+    grad_weight = einops.einsum(
+      grad_output, input_tensor, "... d_out, ... d_in -> d_out d_in"
+    )
+
+    # sync and shard the local weight gradient.
+    grad_weight_chunks = list(grad_weight.chunk(chunks=world_size, dim=0))
+    grad_weight_local = torch.empty_like(grad_weight_chunks[0])
+    dist.reduce_scatter(
+      grad_weight_local, grad_weight_chunks, op=dist.ReduceOp.AVG
+    )
+
+    return None, grad_input, grad_weight_local
 
 
 class FSDPLinearWrapper(nn.Module):
@@ -53,10 +81,54 @@ class FSDPLinearWrapper(nn.Module):
     self.weight = nn.Parameter(local_shard)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    chunks = [torch.empty_like(self.weight) for _ in range(self.world_size)]
-    dist.all_gather(tensor_list=chunks, tensor=self.weight)
-    self.weight.data = torch.concat(chunks, dim=0)
-    return einops.einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
+    return FSDPLinearFunction.apply(self, x, self.weight)
+
+
+class FSDPEmbeddingFunction(torch.autograd.Function):
+  @staticmethod
+  def forward(ctx, wrapper, input_tensor, weight):
+    """
+    Args:
+      ctx: Context object to save information for backward pass.
+      input_tensor: (...,) - indices into the embedding table.
+      weight: (vocab_size, embedding_dim).
+    """
+    ctx.save_for_backward(input_tensor, weight)
+    ctx.world_size = wrapper.world_size
+
+    # Sync and assemble the full weight.
+    chunks = [torch.empty_like(weight) for _ in range(wrapper.world_size)]
+    dist.all_gather(tensor_list=chunks, tensor=weight)
+    full_weight = torch.concat(chunks, dim=0)
+
+    y = full_weight[input_tensor, :]  # (..., embedding_dim)
+    return y
+
+  @staticmethod
+  def backward(ctx, grad_output):
+    input_tensor = ctx.saved_tensors[0]  # (...,)
+    weight = ctx.saved_tensors[1]  # (vocab_size / world_size, embedding_dim)
+    world_size = ctx.world_size
+
+    num_classes = weight.shape[0] * world_size
+
+    input_one_hot = F.one_hot(input_tensor, num_classes=num_classes).to(
+      grad_output.dtype
+    )  # (..., vocab_size)
+
+    grad_weight = einops.einsum(
+      grad_output,
+      input_one_hot,
+      "... d_int, ... vocab_size -> vocab_size d_int",
+    )
+
+    # sync and shard the local weight gradient.
+    grad_weight_chunks = list(grad_weight.chunk(chunks=world_size, dim=0))
+    grad_weight_local = torch.empty_like(grad_weight_chunks[0])
+    dist.reduce_scatter(
+      grad_weight_local, grad_weight_chunks, op=dist.ReduceOp.AVG
+    )
+    return None, None, grad_weight_local
 
 
 class FSDPEmbeddingWrapper(nn.Module):
@@ -76,19 +148,20 @@ class FSDPEmbeddingWrapper(nn.Module):
     self.weight = nn.Parameter(local_shard)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    chunks = [torch.empty_like(self.weight) for _ in range(self.world_size)]
-    dist.all_gather(tensor_list=chunks, tensor=self.weight)
-    self.weight.data = torch.concat(chunks, dim=0)
-    return self.weight[x, :]
+    return FSDPEmbeddingFunction.apply(self, x, self.weight)
 
 
 class FSDP(nn.Module):
-  def __init__(self, module: nn.Module):
+  def __init__(
+    self, module: nn.Module, compute_dtype: torch.dtype | None = None
+  ):
     super().__init__()
     self.module = module
 
     self.rank = dist.get_rank()
     self.world_size = dist.get_world_size()
+
+    self.shard_params = set()
 
     leaf_module_types = get_leaf_module_types(self.module)
     if self.rank == 0:
@@ -111,6 +184,7 @@ class FSDP(nn.Module):
           name,
           FSDPLinearWrapper(module, world_size=self.world_size, rank=self.rank),
         )
+        self.shard_params.add(getattr(root, name).weight)
       elif isinstance(module, model.Embedding):
         # print("Wrapping embedding")
         setattr(
@@ -120,6 +194,7 @@ class FSDP(nn.Module):
             module, world_size=self.world_size, rank=self.rank
           ),
         )
+        self.shard_params.add(getattr(root, name).weight)
       elif len(list(module.children())) > 0:
         self._apply_fsdp(module)
     return root
@@ -128,4 +203,23 @@ class FSDP(nn.Module):
     return self.module(x)
 
   def finish_gradient_synchronization(self) -> None:
-    pass
+    # Sync the replicated params' gradients.
+    for param in self.module.parameters():
+      if param not in self.shard_params:
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
+  def gather_full_params(self) -> dict[str, torch.Tensor]:
+    """All-gather sharded params to reconstruct full parameter tensors.
+
+    Replicated parameters are returned as-is."""
+    ret = {}
+    for name, param in self.module.named_parameters():
+      if param not in self.shard_params:
+        ret[name] = param.data
+      else:
+        chunks = []
+        for _ in range(self.world_size):
+          chunks.append(torch.empty_like(param.data))
+        dist.all_gather(chunks, param.data.detach())
+        ret[name] = torch.concat(chunks, dim=0)
+    return ret

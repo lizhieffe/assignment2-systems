@@ -12,10 +12,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from cs336_basics import model, optimizer
+from cs336_systems.nn_module_util import get_leaf_modules, get_leaf_module_types
 
-#import assignment_7_fsdp_v1 as fsdp_lib
-#import assignment_7_fsdp_v2 as fsdp_lib
+# import assignment_7_fsdp_v1 as fsdp_lib
+# import assignment_7_fsdp_v2 as fsdp_lib
 import assignment_7_fsdp_v3 as fsdp_lib
+
 
 from cs336_systems.model_configs import (  # noqa: F401
   MODEL_CONFIG_S,
@@ -93,6 +95,7 @@ def distributed_train(
       num_heads=model_config["num_heads"],
       d_ff=model_config["d_ff"],
     ).to(device, dtype=torch.bfloat16)
+
     fsdp_m = fsdp_class(m)
     opt = optimizer.AdamW(fsdp_m.parameters())
 
@@ -100,6 +103,9 @@ def distributed_train(
 
     torch.cuda.reset_peak_memory_stats()
     y = fsdp_m(x)
+    print(f"{type(y.grad_fn)=}")
+    print(f"{y.grad_fn.next_functions=}")
+
     loss = y.sum()
     hbm_fwd_mb = torch.cuda.max_memory_allocated() / 1024**2
     print(f"{hbm_fwd_mb=:.2f}")
