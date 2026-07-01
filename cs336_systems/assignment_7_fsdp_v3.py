@@ -63,9 +63,11 @@ class FSDPLinearFunction(torch.autograd.Function):
     return None, grad_input, grad_weight_local
 
 
-class FSDPLinearWrapper(nn.Module):
+class FSDPLinearWrapper(model.Linear):
   def __init__(self, module: nn.Module, rank: int, world_size: int):
-    super().__init__()
+    nn.Module.__init__(
+      self
+    )  # Avoid using super() to avoid issues with multiple inheritance.
     assert isinstance(module, model.Linear)
 
     self.rank = rank
@@ -131,9 +133,11 @@ class FSDPEmbeddingFunction(torch.autograd.Function):
     return None, None, grad_weight_local
 
 
-class FSDPEmbeddingWrapper(nn.Module):
+class FSDPEmbeddingWrapper(model.Embedding):
   def __init__(self, module: nn.Module, rank: int, world_size: int):
-    super().__init__()
+    nn.Module.__init__(
+      self
+    )  # skip nn.Embedding.__init__() because we will override the weight parameter
     assert isinstance(module, model.Embedding)
     self.rank = rank
     self.world_size = world_size
